@@ -1,9 +1,13 @@
 [project]
 name = "bookshelf-sniper"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 version = "0.1.0"
 description = "Transformer une photo de tranches de livres en un tableau de prix de rachat."
 authors = [{ name = "Jules", email = "jules@example.com" }]
-requires-python = ">=3.10"
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn>=0.22.0",
@@ -23,10 +27,6 @@ dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
 ]
-
-[tool.pytest.ini_options]
-asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
 
 [build-system]
 requires = ["setuptools>=61.0"]
