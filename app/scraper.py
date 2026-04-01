@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Optional
 
 import httpx
+from playwright.async_api import async_playwright
 
 logger = logging.getLogger(__name__)
 
@@ -14,20 +15,45 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate, br",
 }
 
-# Momox France — try multiple known API patterns
+# Momox France — known JSON API endpoints (fastest path)
 MOMOX_API_URLS = [
     "https://www.momox.fr/ajax/sell/additem/?ean={isbn}",
     "https://www.momox.fr/ajax/sell/additem/?isbn={isbn}",
     "https://www.momox.fr/fr_FR/volumes/search/?q={isbn}",
-    "https://www.momox.fr/fr/ajax/sell/item/?ean={isbn}",
 ]
-# Keep a single string alias for backward compat with Playwright fallback
-MOMOX_API_URL = MOMOX_API_URLS[2]
+# Playwright fallback page
+MOMOX_PAGE_URL = "https://www.momox.fr/livres/{isbn}/"
 
-# RecycLivre reprise (buyback) page — ISBN lookup
+# RecycLivre reprise (buyback) pages
 RECYCLIVRE_URL = "https://www.recyclivre.com/reprise/?isbn={isbn}"
-# Fallback search URL
 RECYCLIVRE_SEARCH_URL = "https://www.recyclivre.com/shop/0-0/search/?q={isbn}"
+
+# CSS selectors tried in order for each site
+MOMOX_SELECTORS = [
+    ".ScreenMediumItemBuyPrice__price",
+    "[data-testid='buy-price']",
+    "[data-testid='price']",
+    ".buyback-price",
+    ".price",
+]
+RECYCLIVRE_SELECTORS = [
+    ".buyback-price",
+    ".product-buyback-price",
+    "[data-buyback-price]",
+    ".price-buyback",
+    ".reprise-price",
+    ".price",
+]
+
+_PRICE_RE = re.compile(r"(\d+[.,]\d{2})\s*€")
+
+
+def _parse_price(text: str) -> Optional[float]:
+    """Extract the first euro price from a text string."""
+    match = _PRICE_RE.search(text)
+    if match:
+        return float(match.group(1).replace(",", "."))
+    return None
 
 
 class ValuationScraper:
@@ -35,21 +61,21 @@ class ValuationScraper:
         self.semaphore = asyncio.Semaphore(3)
         self._client: Optional[httpx.AsyncClient] = None
         self._price_cache: dict[str, Dict[str, float]] = {}
-        # Playwright is only used as fallback; keep optional
         self._playwright = None
         self._browser = None
 
     async def start(self):
-        """Initialize the HTTP client pool — call at app startup."""
+        """Initialize the HTTP client and Playwright browser."""
         self._client = httpx.AsyncClient(
             headers=HEADERS,
             timeout=httpx.Timeout(15.0),
             follow_redirects=True,
         )
-        logger.info("HTTP client started.")
+        await self._ensure_playwright()
+        logger.info("Scraper started.")
 
     async def stop(self):
-        """Close HTTP client and optional Playwright browser — call at app shutdown."""
+        """Close HTTP client and Playwright browser."""
         if self._client:
             await self._client.aclose()
             self._client = None
@@ -62,91 +88,74 @@ class ValuationScraper:
         logger.info("Scraper stopped.")
 
     async def _ensure_playwright(self):
-        """Lazily start Playwright only if needed."""
+        """Start a headless Chromium browser if not already running."""
         if self._browser is not None:
             return
         try:
-            from playwright.async_api import async_playwright
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch(headless=True)
-            logger.info("Playwright browser started (fallback).")
-        except Exception as e:
-            logger.warning("Could not start Playwright: %s", e)
+            logger.info("Playwright browser started.")
+        except Exception as exc:
+            logger.warning("Could not start Playwright: %s", exc)
 
     async def get_prices(self, isbn: str) -> Dict[str, float]:
-        """Fetch prices from Momox and RecycLivre for a given ISBN."""
+        """Return Momox and RecycLivre buyback prices for the given ISBN.
+
+        Results are cached in-memory so each ISBN is only fetched once per
+        scraper lifetime.
+        """
         if isbn in self._price_cache:
             logger.debug("Cache hit for ISBN %s", isbn)
             return self._price_cache[isbn]
 
         async with self.semaphore:
-            momox_task = self._scrape_momox(isbn)
-            recyclivre_task = self._scrape_recyclivre(isbn)
-            prices_results = await asyncio.gather(momox_task, recyclivre_task, return_exceptions=True)
+            momox_price, recyclivre_price = await asyncio.gather(
+                self._scrape_momox(isbn),
+                self._scrape_recyclivre(isbn),
+                return_exceptions=True,
+            )
 
-            p0: float = 0.0
-            p1: float = 0.0
-
-            if len(prices_results) > 0:
-                val0 = prices_results[0]
-                if isinstance(val0, (float, int)):
-                    p0 = float(val0)
-
-            if len(prices_results) > 1:
-                val1 = prices_results[1]
-                if isinstance(val1, (float, int)):
-                    p1 = float(val1)
-
-            result = {"momox": p0, "recyclivre": p1}
+            result = {
+                "momox": float(momox_price) if isinstance(momox_price, (int, float)) else 0.0,
+                "recyclivre": float(recyclivre_price) if isinstance(recyclivre_price, (int, float)) else 0.0,
+            }
             self._price_cache[isbn] = result
             return result
 
     async def _scrape_momox(self, isbn: str) -> Optional[float]:
+        """Fetch Momox buyback price.
+
+        Strategy:
+        1. Try each known JSON API endpoint via httpx (fast, no browser).
+        2. If all fail, navigate to the Momox book page with Playwright.
+        3. Try a list of CSS selectors; fall back to a body-text regex.
         """
-        Fetch Momox buyback price via their JSON API.
-        Falls back to Playwright page scrape if the API fails.
-        """
-        # --- httpx attempt (try all known API endpoints) ---
+        # --- HTTP API attempt ---
         if self._client:
-            for url_template in MOMOX_API_URLS:
+            for url_tpl in MOMOX_API_URLS:
                 try:
-                    url = url_template.format(isbn=isbn)
-                    resp = await self._client.get(url)
-                    if resp.status_code == 200:
-                        try:
-                            data = resp.json()
-                            # Momox API may return: {"items": [{"buybackPrice": 1.50}]}
-                            # or {"buyPrice": 1.50} or {"price": 1.50}
-                            items = data.get("items") or data.get("results") or []
-                            if items:
-                                for item in items:
-                                    price = (
-                                        item.get("buybackPrice")
-                                        or item.get("buyPrice")
-                                        or item.get("price")
-                                        or item.get("buy_price")
-                                    )
-                                    if price is not None:
-                                        return float(price)
-                            else:
-                                # Flat response
-                                price = (
-                                    data.get("buybackPrice")
-                                    or data.get("buyPrice")
-                                    or data.get("price")
-                                )
-                                if price is not None:
-                                    return float(price)
-                        except Exception:
-                            # Not JSON — try regex on raw text
-                            match = re.search(r'(\d+[.,]\d{2})\s*\u20ac', resp.text)
-                            if match:
-                                return float(match.group(1).replace(",", "."))
-                except Exception as e:
-                    logger.debug("Momox httpx request failed (%s) for %s: %s", url_template, isbn, e)
+                    resp = await self._client.get(url_tpl.format(isbn=isbn))
+                    if resp.status_code != 200:
+                        continue
+                    try:
+                        data = resp.json()
+                        # Flat response
+                        for key in ("buybackPrice", "buyPrice", "price", "buy_price"):
+                            if data.get(key) is not None:
+                                return float(data[key])
+                        # Nested list response
+                        for item in data.get("items") or data.get("results") or []:
+                            for key in ("buybackPrice", "buyPrice", "price"):
+                                if item.get(key) is not None:
+                                    return float(item[key])
+                    except Exception:
+                        price = _parse_price(resp.text)
+                        if price is not None:
+                            return price
+                except Exception as exc:
+                    logger.debug("Momox HTTP request failed (%s) for %s: %s", url_tpl, isbn, exc)
 
         # --- Playwright fallback ---
-        await self._ensure_playwright()
         if self._browser is None:
             return None
 
@@ -154,80 +163,62 @@ class ValuationScraper:
             context = await self._browser.new_context(user_agent=HEADERS["User-Agent"])
             page = await context.new_page()
             try:
-                # Try a browseable Momox page before falling back to the API URL
-                for url in [
-                    f"https://www.momox.fr/livres/{isbn}/",
-                    MOMOX_API_URL.format(isbn=isbn),
-                ]:
-                    try:
-                        r = await page.goto(url, timeout=12000, wait_until="domcontentloaded")
-                        if r and r.status < 400:
-                            await page.wait_for_timeout(1500)
-                            break
-                    except Exception:
-                        continue
-                selectors = [
-                    ".ScreenMediumItemBuyPrice__price",
-                    "[data-testid='price']",
-                    ".price",
-                    ".price-value",
-                    ".offer-price",
-                ]
-                for selector in selectors:
+                await page.goto(
+                    MOMOX_PAGE_URL.format(isbn=isbn),
+                    timeout=15000,
+                    wait_until="domcontentloaded",
+                )
+                await page.wait_for_timeout(1500)
+
+                for selector in MOMOX_SELECTORS:
                     try:
                         el = page.locator(selector).first
                         if await el.count() > 0:
-                            price_text = await el.inner_text(timeout=3000)
-                            return float(price_text.replace("\u20ac", "").replace(",", ".").strip())
+                            text = await el.inner_text(timeout=3000)
+                            price = _parse_price(text)
+                            if price is not None:
+                                return price
                     except Exception:
                         continue
-                try:
-                    body_text = await page.inner_text("body", timeout=3000)
-                    match = re.search(r'(\d+[.,]\d{2})\s*\u20ac', body_text)
-                    if match:
-                        return float(match.group(1).replace(",", "."))
-                except Exception:
-                    pass
-                return None
+
+                body = await page.inner_text("body", timeout=5000)
+                return _parse_price(body)
             finally:
                 await context.close()
-        except Exception as e:
-            logger.debug("Momox Playwright fallback failed for %s: %s", isbn, e)
-            return None
+        except Exception as exc:
+            logger.debug("Momox Playwright failed for %s: %s", isbn, exc)
+
+        return None
 
     async def _scrape_recyclivre(self, isbn: str) -> Optional[float]:
+        """Fetch RecycLivre buyback price.
+
+        Strategy:
+        1. Try the reprise page and search page via httpx.
+        2. If both fail, navigate with Playwright.
+        3. Try CSS selectors; fall back to body-text regex.
         """
-        Fetch RecycLivre buyback price via httpx.
-        Falls back to Playwright if needed.
-        """
-        # --- httpx attempt (reprise page first, then search) ---
+        # --- HTTP attempt ---
         if self._client:
-            for url_template in (RECYCLIVRE_URL, RECYCLIVRE_SEARCH_URL):
+            for url_tpl in (RECYCLIVRE_URL, RECYCLIVRE_SEARCH_URL):
                 try:
-                    url = url_template.format(isbn=isbn)
-                    resp = await self._client.get(url)
-                    if resp.status_code == 200:
-                        # Try JSON
-                        try:
-                            data = resp.json()
-                            price = (
-                                data.get("buybackPrice")
-                                or data.get("price")
-                                or data.get("reprise_price")
-                            )
-                            if price is not None:
-                                return float(price)
-                        except Exception:
-                            pass
-                        # Try regex on HTML
-                        match = re.search(r'(\d+[.,]\d{2})\s*\u20ac', resp.text)
-                        if match:
-                            return float(match.group(1).replace(",", "."))
-                except Exception as e:
-                    logger.debug("RecycLivre httpx request failed (%s) for %s: %s", url_template, isbn, e)
+                    resp = await self._client.get(url_tpl.format(isbn=isbn))
+                    if resp.status_code != 200:
+                        continue
+                    try:
+                        data = resp.json()
+                        for key in ("buybackPrice", "price", "reprise_price"):
+                            if data.get(key) is not None:
+                                return float(data[key])
+                    except Exception:
+                        pass
+                    price = _parse_price(resp.text)
+                    if price is not None:
+                        return price
+                except Exception as exc:
+                    logger.debug("RecycLivre HTTP request failed (%s) for %s: %s", url_tpl, isbn, exc)
 
         # --- Playwright fallback ---
-        await self._ensure_playwright()
         if self._browser is None:
             return None
 
@@ -235,35 +226,32 @@ class ValuationScraper:
             context = await self._browser.new_context(user_agent=HEADERS["User-Agent"])
             page = await context.new_page()
             try:
-                url = RECYCLIVRE_URL.format(isbn=isbn)
-                await page.goto(url, timeout=15000)
-                selectors = [
-                    ".buyback-price",
-                    ".product-buyback-price",
-                    "[data-buyback-price]",
-                    ".price-buyback",
-                ]
-                for selector in selectors:
+                await page.goto(
+                    RECYCLIVRE_URL.format(isbn=isbn),
+                    timeout=15000,
+                    wait_until="domcontentloaded",
+                )
+                await page.wait_for_timeout(1500)
+
+                for selector in RECYCLIVRE_SELECTORS:
                     try:
                         el = page.locator(selector).first
                         if await el.count() > 0:
-                            price_text = await el.inner_text(timeout=3000)
-                            return float(price_text.replace("\u20ac", "").replace(",", ".").strip())
+                            text = await el.inner_text(timeout=3000)
+                            price = _parse_price(text)
+                            if price is not None:
+                                return price
                     except Exception:
                         continue
-                try:
-                    body_text = await page.inner_text("body", timeout=3000)
-                    match = re.search(r'(\d+[.,]\d{2})\s*\u20ac', body_text)
-                    if match:
-                        return float(match.group(1).replace(",", "."))
-                except Exception:
-                    pass
-                return None
+
+                body = await page.inner_text("body", timeout=5000)
+                return _parse_price(body)
             finally:
                 await context.close()
-        except Exception as e:
-            logger.debug("RecycLivre Playwright fallback failed for %s: %s", isbn, e)
-            return None
+        except Exception as exc:
+            logger.debug("RecycLivre Playwright failed for %s: %s", isbn, exc)
+
+        return None
 
 
 # Singleton instance
