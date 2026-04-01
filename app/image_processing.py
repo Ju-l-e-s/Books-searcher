@@ -4,6 +4,7 @@ import easyocr
 from ultralytics import YOLO
 import io
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +19,19 @@ class ImageProcessor:
     def model(self):
         """Lazy-load YOLO model on first use instead of at import time."""
         if self._model is None:
-            try:
-                self._model = YOLO("book-spines.pt")
+            custom_model_path = Path(__file__).resolve().parent.parent / "book-spines.pt"
+            if custom_model_path.exists():
+                self._model = YOLO(str(custom_model_path))
                 self._is_custom_model = True
                 logger.info("Loaded custom book-spines YOLO model.")
-            except Exception:
+            else:
+                logger.warning(
+                    "book-spines.pt not found at %s. "
+                    "To use a custom YOLO model, place your trained book-spines.pt "
+                    "in the project root. Falling back to yolov8n.pt (auto-downloaded). "
+                    "See README for training instructions.",
+                    custom_model_path,
+                )
                 self._model = YOLO("yolov8n.pt")
                 self._is_custom_model = False
                 logger.info("Loaded standard yolov8n YOLO model (fallback).")
@@ -44,9 +53,7 @@ class ImageProcessor:
             return []
 
         # 1. Segmentation
-        # Cast to Any to satisfy the linter when external types are not found
-        from typing import Any
-        results: Any = self.model(img)
+        results = self.model(img)
         spines = []
 
         for result in results:

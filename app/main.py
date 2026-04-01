@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import List
 
+from typing import Any, List
+
 from app.image_processing import processor
 from app.isbn_resolver import resolver
 from app.scraper import scraper
@@ -59,9 +61,7 @@ async def analyze_shelf(image: UploadFile = File(...)):
 
         # 2. Resolve ISBNs (Parallel)
         resolve_tasks = [resolver.resolve(text) for text in ocr_texts]
-        # Cast to Any to satisfy the linter when external types are not found
-        from typing import Any
-        resolved_results: Any = await asyncio.gather(*resolve_tasks, return_exceptions=True)
+        resolved_results: List[Any] = await asyncio.gather(*resolve_tasks, return_exceptions=True)
 
         # Flatten and keep only the best candidate per OCR text
         potential_books = []
