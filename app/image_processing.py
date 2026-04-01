@@ -77,6 +77,14 @@ class ImageProcessor:
                     if text:
                         spines.append(text)
 
+        # Fallback: if YOLO detected nothing, run OCR on the full image
+        if not spines:
+            logger.info("No book spines detected by YOLO, falling back to full-image OCR.")
+            gray_full = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            text = self._ocr_crop(gray_full)
+            if text:
+                spines.append(text)
+
         # Normalize before deduplication (case-insensitive, stripped)
         seen = set()
         unique_spines = []

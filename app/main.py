@@ -1,12 +1,11 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import asyncio
 import logging
 from pathlib import Path
-from typing import List
-
-from typing import Any, List
+from typing import List, Any
 
 from app.image_processing import processor
 from app.isbn_resolver import resolver
@@ -16,24 +15,23 @@ from app.models import BookResult
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="BookShelf Sniper")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await scraper.start()
+    except Exception as e:
+        logger.error("Browser pool failed to start (scraping disabled): %s", e)
+    yield
+    await scraper.stop()
+    await resolver.close()
+
+
+app = FastAPI(title="BookShelf Sniper", lifespan=lifespan)
 
 # Fix B9: Use absolute path relative to this file, not CWD
 _BASE_DIR = Path(__file__).resolve().parent
 app.mount("/static", StaticFiles(directory=str(_BASE_DIR / "static")), name="static")
-
-
-@app.on_event("startup")
-async def startup():
-    """Initialize the browser pool for scraping."""
-    await scraper.start()
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    """Cleanup browser pool and HTTP clients."""
-    await scraper.stop()
-    await resolver.close()
 
 
 @app.get("/", response_class=HTMLResponse)

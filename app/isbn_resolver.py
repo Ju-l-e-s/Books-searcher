@@ -1,15 +1,22 @@
 import httpx
 from rapidfuzz import fuzz
-from typing import List
+from typing import List, Optional
 import asyncio
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_isbn(isbn: str) -> str:
+    """Strip hyphens and spaces from an ISBN string."""
+    return re.sub(r"[\s\-]", "", isbn)
 
 
 class ISBNResolver:
     GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
     OPEN_LIBRARY_URL = "https://openlibrary.org/search.json"
+    OPEN_LIBRARY_BOOKS_URL = "https://openlibrary.org/api/books"
 
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=10.0)
@@ -98,6 +105,41 @@ class ISBNResolver:
         except Exception as e:
             logger.debug("Open Library search failed: %s", e)
             return []
+
+    async def lookup_by_isbn(self, isbn: str) -> Optional[dict]:
+        """Look up a book directly by ISBN using the Open Library Books API.
+
+        Returns a dict with title, author, isbn, and source, or None if not found.
+        """
+        normalized = _normalize_isbn(isbn)
+        bibkey = f"ISBN:{normalized}"
+        params = {"bibkeys": bibkey, "format": "json", "jscmd": "data"}
+        try:
+            resp = await self.client.get(self.OPEN_LIBRARY_BOOKS_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+            book = data.get(bibkey)
+            if not book:
+                logger.debug("Open Library found no result for %s", bibkey)
+                return None
+
+            authors = [a.get("name", "") for a in book.get("authors", [])]
+            isbn_list = book.get("identifiers", {}).get("isbn_13") or \
+                        book.get("identifiers", {}).get("isbn_10") or \
+                        [normalized]
+
+            return {
+                "title": book.get("title", ""),
+                "author": ", ".join(authors),
+                "isbn": isbn_list[0],
+                "source": "open_library",
+                "publish_date": book.get("publish_date", ""),
+                "cover_url": book.get("cover", {}).get("large", ""),
+            }
+        except Exception as e:
+            logger.warning("Open Library ISBN lookup failed for %s: %s", isbn, e)
+            return None
 
 
 # Singleton instance
