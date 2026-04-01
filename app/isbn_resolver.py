@@ -1,182 +1,252 @@
+"""ISBN Resolver — weighted triangulation engine (Lambda-ready).
+
+Scoring breakdown (max ~100 pts before penalties):
+  - Title  30 %  : fuzz.token_set_ratio vs OCR text
+  - Author 20 %  : +60 raw bonus when author token found in OCR
+  - Publisher 40%: keyword match (Gallimard, Folio, Pocket …)
+  - Format 10 %  : bbox w/h < 0.1 → "Poche" hint
+
+Anti-noise penalties applied after scoring:
+  - -80 pts for study/analysis titles ("Fiche de lecture", "Analyse", …)
+  - Penalise year editions (ex. "Larousse 2012") when OCR has no year
+"""
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import re
+import time
+from typing import Any, Optional
+
 import httpx
 from rapidfuzz import fuzz
-from typing import List
-import asyncio
-import logging
-import re
-import os
-from dotenv import load_dotenv
-
-# Charge les variables depuis le fichier .env
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# ── publisher keywords → discriminate editions ────────────────────────────────
+PUBLISHER_KEYWORDS = {
+    "gallimard", "folio", "pocket", "flammarion", "hachette", "grasset",
+    "seuil", "actes sud", "albin michel", "calmann", "fayard", "plon",
+    "robert laffont", "stock", "minuit", "denoël", "le livre de poche",
+    "j'ai lu", "points", "babel", "rivages",
+}
+
+# Anti-noise title tokens — penalise these candidates
+_NOISE_TOKENS = re.compile(
+    r"\b(fiche\s+de\s+lecture|analyse|étude|bd|illustré)\b", re.IGNORECASE
+)
+
+# Year pattern for anti-millesime check
+_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
+
+# ── DynamoDB cache (domain-level, optional) ───────────────────────────────────
+_ISBN_TABLE_NAME: Optional[str] = os.environ.get("ISBN_CACHE_TABLE")
+_ISBN_TTL = 30 * 24 * 3600  # 30 days
+
+
+class _DynamoCache:
+    """Thin, fault-tolerant DynamoDB wrapper (synchronous boto3)."""
+
+    def __init__(self, table_name: Optional[str]) -> None:
+        self._table_name = table_name
+        self._table: Any = None
+
+    def _get_table(self) -> Any:
+        if self._table is None and self._table_name:
+            try:
+                import boto3  # imported lazily — not available in tests
+                self._table = boto3.resource("dynamodb").Table(self._table_name)
+            except Exception as exc:
+                logger.debug("DynamoDB unavailable: %s", exc)
+        return self._table
+
+    def get(self, key: str) -> Optional[Any]:
+        table = self._get_table()
+        if not table:
+            return None
+        try:
+            resp = table.get_item(Key={"pk": key})
+            item = resp.get("Item")
+            if item and int(item.get("ttl", 0)) > int(time.time()):
+                return json.loads(item["value"])
+        except Exception as exc:
+            logger.debug("DynamoDB get error: %s", exc)
+        return None
+
+    def set(self, key: str, value: Any, ttl_seconds: int) -> None:
+        table = self._get_table()
+        if not table:
+            return
+        try:
+            table.put_item(Item={
+                "pk": key,
+                "value": json.dumps(value, ensure_ascii=False),
+                "ttl": int(time.time()) + ttl_seconds,
+            })
+        except Exception as exc:
+            logger.debug("DynamoDB put error: %s", exc)
+
+
+_isbn_cache = _DynamoCache(_ISBN_TABLE_NAME)
+
+
+# ── scoring helpers ───────────────────────────────────────────────────────────
+
+def _score_title(ocr: str, candidate_title: str) -> float:
+    """30 % weight: fuzz.token_set_ratio, returns 0-100."""
+    return fuzz.token_set_ratio(ocr.lower(), candidate_title.lower())
+
+
+def _score_author(ocr: str, candidate_author: str, primary_author: Optional[str]) -> float:
+    """20 % weight: +60 raw pts when any author token appears in OCR.
+
+    If a primary author is known, secondary authors (illustrateurs, préfaciers)
+    are ignored — only the primary author is checked.
+    """
+    author_to_check = primary_author if primary_author else candidate_author
+    if not author_to_check:
+        return 0.0
+    # Split on common separators; check each token
+    tokens = re.split(r"[\s,.\-]+", author_to_check.lower())
+    tokens = [t for t in tokens if len(t) >= 3]
+    ocr_lower = ocr.lower()
+    if any(t in ocr_lower for t in tokens):
+        return 60.0
+    return 0.0
+
+
+def _score_publisher(ocr: str, candidate_publisher: str) -> float:
+    """40 % weight: binary keyword match, returns 0 or 100."""
+    combined = (ocr + " " + candidate_publisher).lower()
+    if any(kw in combined for kw in PUBLISHER_KEYWORDS):
+        return 100.0
+    return 0.0
+
+
+def _score_format(bbox_ratio: Optional[float]) -> float:
+    """10 % weight: w/h < 0.1 → 'Poche' format, returns 0 or 100."""
+    if bbox_ratio is not None and bbox_ratio < 0.1:
+        return 100.0
+    return 0.0
+
+
+def _apply_penalties(score: float, candidate_title: str, ocr: str) -> float:
+    """Apply anti-noise and anti-millesime deductions."""
+    # Anti-noise: study / analysis editions
+    if _NOISE_TOKENS.search(candidate_title):
+        score -= 80.0
+
+    # Anti-millesime: penalise year editions when OCR has no year
+    if _YEAR_RE.search(candidate_title) and not _YEAR_RE.search(ocr):
+        score -= 40.0
+
+    return score
+
+
+def _compute_score(
+    ocr: str,
+    candidate: dict,
+    primary_author: Optional[str],
+    bbox_ratio: Optional[float],
+) -> float:
+    title = candidate.get("title", "")
+    author = candidate.get("author", "")
+    publisher = candidate.get("publisher", "")
+
+    ts = _score_title(ocr, title) * 0.30
+    as_ = _score_author(ocr, author, primary_author) * 0.20
+    ps = _score_publisher(ocr, publisher) * 0.40
+    fs = _score_format(bbox_ratio) * 0.10
+
+    raw = ts + as_ + ps + fs
+    return _apply_penalties(raw, title, ocr)
+
+
+def _detect_primary_author(ocr: str, candidates: list[dict]) -> Optional[str]:
+    """Return the first author whose tokens appear in the OCR text.
+
+    Used to suppress secondary authors (illustrateurs, préfaciers).
+    """
+    for cand in candidates:
+        author = cand.get("author", "")
+        tokens = re.split(r"[\s,.\-]+", author.lower())
+        tokens = [t for t in tokens if len(t) >= 3]
+        if tokens and any(t in ocr.lower() for t in tokens):
+            return author
+    return None
+
+
+# ── external API helpers ──────────────────────────────────────────────────────
 
 class ISBNResolver:
     GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
     OPEN_LIBRARY_URL = "https://openlibrary.org/search.json"
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.client = httpx.AsyncClient(timeout=10.0)
-        self.api_key = os.getenv("GOOGLE_BOOKS_API_KEY")
 
-    async def close(self):
-        """Properly close the HTTP client — call at app shutdown."""
+    async def close(self) -> None:
         await self.client.aclose()
         logger.info("ISBNResolver HTTP client closed.")
 
-    async def resolve(self, query: str) -> List[dict]:
-        """Resolve OCR text to its most likely ISBN."""
-        if not query or len(query.strip()) < 4:
+    async def resolve(
+        self,
+        query: str,
+        bbox_ratio: Optional[float] = None,
+    ) -> list[dict]:
+        """Resolve OCR text to the most likely ISBN using weighted scoring."""
+        if not query or len(query.strip()) < 5:
             return []
 
-        # 1. Clean query for search
-        # Remove common OCR noise, artifacts, and punctuation at start/end
-        clean_query = query.upper()
-        clean_query = clean_query.replace("LIVRE DE POCHE", "").replace("LIVRE POCHE", "")
-        # Remove leading/trailing non-alphanumeric chars (like ~ or 3)
-        clean_query = re.sub(r'^[^A-Z0-9]+', '', clean_query)
-        clean_query = re.sub(r'[^A-Z0-9]+$', '', clean_query)
-        # Remove leading/trailing digits followed/preceded by space (OCR artifacts like '3 ')
-        clean_query = re.sub(r'^\s*\d+\s+', '', clean_query)
-        clean_query = re.sub(r'\s+\d+\s*$', '', clean_query)
-        clean_query = clean_query.strip()
-        
-        if not clean_query:
-            return []
-            
-        search_query = clean_query
-        print(f"DEBUG: Recherche ISBN pour: '{search_query}'")
+        query = query.strip()
+        cache_key = hashlib.sha256(query.encode()).hexdigest()
 
-        # 2. Parallel API calls
-        gb_task = self._search_google_books(search_query)
-        ol_task = self._search_open_library(search_query)
+        # Cache read (run sync boto3 in thread to avoid blocking event loop)
+        cached = await asyncio.to_thread(_isbn_cache.get, cache_key)
+        if cached is not None:
+            logger.debug("ISBN cache hit for query hash %s", cache_key[:8])
+            return cached
 
+        # Parallel API queries
+        gb_task = self._search_google_books(query)
+        ol_task = self._search_open_library(query)
         results = await asyncio.gather(gb_task, ol_task, return_exceptions=True)
 
-        candidates: List[dict] = []
+        candidates: list[dict] = []
         for result in results:
             if isinstance(result, Exception):
-                print(f"DEBUG: Erreur API (Grave): {result}")
+                logger.warning("Search API failed: %s", result)
                 continue
             if isinstance(result, list):
                 candidates.extend(result)
 
         if not candidates:
-            print(f"DEBUG: Aucun candidat trouvé par l'API pour '{search_query}'")
             return []
 
+        # Detect primary author to suppress secondary authors
+        primary_author = _detect_primary_author(query, candidates)
+
+        # Weighted scoring + penalties
         for cand in candidates:
-            # 1. Clean title for scoring and display
-            t = cand.get('title', '')
-            # Remove subtitles and study guide notes (anything after -, :, ()
-            t = re.sub(r'[\(\-\:].*', '', t)
-            # Remove specific noise words
-            for word in ["édition", "illustré", "illustre", "richement", "complet", "intégrale"]:
-                t = re.compile(re.escape(word), re.IGNORECASE).sub("", t)
+            cand["score"] = _compute_score(query, cand, primary_author, bbox_ratio)
 
-            # Smart author stripping from title
-            # We KEEP the author if the title is "Journal d'..." or "Mémoires de..."
-            # Otherwise, we strip "de [Author]" or "par [Author]" at the end.
-            t_lower = t.lower().strip()
-            is_protected = t_lower.startswith("journal") or t_lower.startswith("mémoire") or t_lower.startswith("memoire")
-            
-            if not is_protected:
-                author_raw = str(cand.get('author', ''))
-                for part in author_raw.split(','):
-                    part = part.strip()
-                    if len(part) > 3:
-                        # Strip " de Author", " par Author", etc. at the end
-                        t = re.sub(re.escape(part), '', t, flags=re.IGNORECASE)
-                        t = re.sub(r"['\s]+(de|par|d'|d’)\s*$", "", t, flags=re.IGNORECASE)
+        candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        top = candidates[:3]
 
-            t = t.strip().strip("'").strip("’")
-            title_clean = t.lower()
+        # Cache write
+        await asyncio.to_thread(_isbn_cache.set, cache_key, top, _ISBN_TTL)
 
-            # Clean authors
-            authors_str = str(cand.get('author', ''))
-            authors_list = [re.sub(r'[,\s]+$', '', a).strip() for a in authors_str.split(',')]
-            
-            # Blacklist of study-guide/analysis authors and publishers
-            analysis_junk = ["lepetitlitteraire", "fichesdelecture", "brumont", "noiret", "viteux", "leloup", "ramain", "millot", "ozanam"]
-            authors_list = [a for a in authors_list if a and a.lower().replace(" ", "") not in analysis_junk]
-            
-            # If the query contains a specific author name, only keep that one in the list
-            query_lower = clean_query.lower()
-            matching_authors = []
-            for a in authors_list:
-                a_parts = [p.lower() for p in re.split(r'[,\s]+', a) if len(p) > 2]
-                if any(p in query_lower for p in a_parts):
-                    matching_authors.append(a)
-            
-            if matching_authors:
-                cand['author'] = ", ".join(matching_authors)
-            else:
-                # Fallback: take the first one if it's not in the junk list
-                cand['author'] = authors_list[0] if authors_list else "Unknown"
+        return top
 
-            # Scoring
-            # Use token_set_ratio which is more robust to word order and extra words
-            base_score = fuzz.token_set_ratio(query_lower, title_clean)
-                
-            # Author Bonus: Extremely important
-            author_bonus = 0
-            if cand['author'] != "Unknown":
-                author_lower = cand['author'].lower()
-                author_parts = [p.strip() for p in re.split(r'[,\s]+', author_lower) if len(p.strip()) > 2]
-                match_count = sum(1 for part in author_parts if part in query_lower)
-                
-                if match_count > 0:
-                    author_bonus = 60 + (match_count * 20)
-            
-            # Penalty System
-            penalty = 0
-            full_title_lower = str(cand.get('title', '')).lower()
-            
-            # 1. Study guides / Analysis
-            junk_keywords = [
-                "fiche de lecture", "analyse", "summary", "chapitre", 
-                "profil d'une oeuvre", "profil d'une œuvre", "bac", "concours",
-                "étalage", "pédagogique", "expliquée", "expliquer", "étudier", "étude"
-            ]
-            if any(kw in full_title_lower for kw in junk_keywords):
-                penalty += 80
-            
-            # 2. Graphic novels / Illustrated (unless in query)
-            if any(kw in full_title_lower for kw in ["illustré", "illustre", "bande dessinée", "bd", "graphic novel"]):
-                if "bd" not in query_lower and "dessinée" not in query_lower:
-                    penalty += 50
-            
-            # 3. Year/Edition mismatch (e.g. Larousse 2012 when query is just Larousse)
-            # If query doesn't have a year but title has one, it's likely a specific edition we don't want
-            year_match = re.search(r'\b(20\d{2}|19\d{2})\b', full_title_lower)
-            if year_match and not re.search(r'\b(20\d{2}|19\d{2})\b', query_lower):
-                penalty += 40
-
-            # Final Score calculation
-            score = base_score + author_bonus - penalty
-            cand['score'] = float(max(0.0, min(100.0, score)))
-            cand['title'] = t 
-            print(f"DEBUG: Candidat trouvé: {cand['title']} par {cand['author']} (Score: {cand['score']} [Base: {base_score}, Bonus: {author_bonus}, Penalty: {penalty}])")
-
-        # Sort by best score
-        candidates.sort(key=lambda x: x.get('score', 0.0), reverse=True)
-        # Return top 3 candidates
-        return candidates[:3]
-
-    async def _search_google_books(self, query: str) -> List[dict]:
+    async def _search_google_books(self, query: str) -> list[dict]:
         try:
-            params = {"q": query, "maxResults": 20}
-            if self.api_key:
-                params["key"] = self.api_key
-            
-            resp = await self.client.get(self.GOOGLE_BOOKS_URL, params=params)
-            if resp.status_code != 200:
-                print(f"DEBUG: Google Books status {resp.status_code}: {resp.text}")
-                return []
+            resp = await self.client.get(
+                self.GOOGLE_BOOKS_URL, params={"q": query, "maxResults": 5}
+            )
+            resp.raise_for_status()
             data = resp.json()
-
             candidates = []
             for item in data.get("items", []):
                 info = item.get("volumeInfo", {})
@@ -185,41 +255,42 @@ class ISBNResolver:
                     for ident in info.get("industryIdentifiers", [])
                     if ident.get("type") in ("ISBN_13", "ISBN_10")
                 ]
-                if isbns:
-                    authors = [a.strip() for a in info.get("authors", []) if a and a.strip()]
-                    candidates.append({
-                        "title": info.get("title", ""),
-                        "author": ", ".join(authors),
-                        "isbn": isbns[0],
-                        "source": "google_books"
-                    })
+                if not isbns:
+                    continue
+                candidates.append({
+                    "title": info.get("title", ""),
+                    "author": ", ".join(info.get("authors", [])),
+                    "publisher": info.get("publisher", ""),
+                    "isbn": isbns[0],
+                    "source": "google_books",
+                })
             return candidates
-        except Exception as e:
-            print(f"DEBUG: Google Books error for '{query}': {e}")
+        except Exception as exc:
+            logger.debug("Google Books search failed: %s", exc)
             return []
 
-    async def _search_open_library(self, query: str) -> List[dict]:
+    async def _search_open_library(self, query: str) -> list[dict]:
         try:
-            params = {"q": query, "limit": 20}
-            resp = await self.client.get(self.OPEN_LIBRARY_URL, params=params)
-            if resp.status_code != 200:
-                print(f"DEBUG: Open Library status {resp.status_code}: {resp.text}")
-                return []
+            resp = await self.client.get(
+                self.OPEN_LIBRARY_URL, params={"q": query, "limit": 5}
+            )
+            resp.raise_for_status()
             data = resp.json()
-
             candidates = []
             for doc in data.get("docs", []):
                 isbn_list = doc.get("isbn", [])
-                if isbn_list:
-                    candidates.append({
-                        "title": doc.get("title", ""),
-                        "author": ", ".join(doc.get("author_name", [])),
-                        "isbn": isbn_list[0],
-                        "source": "open_library"
-                    })
+                if not isbn_list:
+                    continue
+                candidates.append({
+                    "title": doc.get("title", ""),
+                    "author": ", ".join(doc.get("author_name", [])),
+                    "publisher": ", ".join(doc.get("publisher", [])),
+                    "isbn": isbn_list[0],
+                    "source": "open_library",
+                })
             return candidates
-        except Exception as e:
-            print(f"DEBUG: Open Library error for '{query}': {e}")
+        except Exception as exc:
+            logger.debug("Open Library search failed: %s", exc)
             return []
 
 
