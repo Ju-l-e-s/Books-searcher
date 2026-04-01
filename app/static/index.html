@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="BookShelf Sniper — Photographiez vos étagères de livres et obtenez instantanément les meilleurs prix de rachat Momox & RecycLivre.">
+    <title>BookShelf Sniper — Valuation de Livres</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0f172a;
+            --card: #1e293b;
+            --accent: #38bdf8;
+            --accent-dim: rgba(56, 189, 248, 0.15);
+            --text: #f8fafc;
+            --muted: #94a3b8;
+            --success: #22c55e;
+            --danger: #ef4444;
+            --border: #334155;
+            --radius: 0.75rem;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem 1rem;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 3rem;
+        }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #38bdf8, #818cf8, #a78bfa);
+            background-size: 200% 200%;
+            animation: gradientShift 4s ease infinite;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.5rem;
+        }
+
+        @keyframes gradientShift {
+            0%, 100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
+        p.subtitle {
+            color: var(--muted);
+            font-size: 1.1rem;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 900px;
+        }
+
+        /* Upload zone */
+        .upload-card {
+            background: var(--card);
+            border: 2px dashed var(--border);
+            border-radius: 1rem;
+            padding: 3rem 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .upload-card:hover, .upload-card.dragover {
+            border-color: var(--accent);
+            background: var(--accent-dim);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(56, 189, 248, 0.1);
+        }
+
+        .upload-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            display: block;
+            transition: transform 0.3s ease;
+        }
+
+        .upload-card:hover .upload-icon {
+            transform: scale(1.15);
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        /* Preview */
+        .preview-container {
+            margin-top: 1.5rem;
+            display: none;
+        }
+
+        .preview-container img {
+            max-width: 100%;
+            max-height: 200px;
+            border-radius: var(--radius);
+            border: 1px solid var(--border);
+            object-fit: contain;
+        }
+
+        /* Loader */
+        .loader {
+            display: none;
+            margin-top: 2rem;
+            text-align: center;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            border: 4px solid rgba(255,255,255,0.1);
+            border-left-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1rem;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .progress-steps {
+            display: flex;
+            gap: 0.5rem;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-top: 0.75rem;
+        }
+
+        .progress-step {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.75rem;
+            border-radius: 1rem;
+            background: var(--card);
+            border: 1px solid var(--border);
+            color: var(--muted);
+            transition: all 0.3s ease;
+        }
+
+        .progress-step.active {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: var(--accent-dim);
+        }
+
+        .progress-step.done {
+            border-color: var(--success);
+            color: var(--success);
+            background: rgba(34, 197, 94, 0.1);
+        }
+
+        /* Results */
+        #results {
+            margin-top: 3rem;
+            display: none;
+            animation: fadeInUp 0.4s ease;
+        }
+
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .results-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+        }
+
+        .results-count {
+            font-size: 0.9rem;
+            color: var(--muted);
+        }
+
+        .results-count strong {
+            color: var(--accent);
+        }
+
+        .table-wrapper {
+            overflow-x: auto;
+            border-radius: var(--radius);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--card);
+            min-width: 600px;
+        }
+
+        th, td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background: #2d3e50;
+            color: var(--accent);
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+            position: sticky;
+            top: 0;
+        }
+
+        tr {
+            transition: background 0.2s ease;
+        }
+
+        tr:hover {
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        .price-tag {
+            font-weight: 600;
+            color: var(--success);
+        }
+
+        .price-zero {
+            color: var(--muted);
+            font-weight: 400;
+        }
+
+        .best-price {
+            background: rgba(34, 197, 94, 0.15);
+            padding: 0.25rem 0.5rem;
+            border-radius: 0.25rem;
+            border: 1px solid var(--success);
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .confidence-bar {
+            display: inline-block;
+            width: 60px;
+            height: 6px;
+            background: var(--border);
+            border-radius: 3px;
+            overflow: hidden;
+            vertical-align: middle;
+            margin-left: 0.5rem;
+        }
+
+        .confidence-fill {
+            height: 100%;
+            background: var(--accent);
+            border-radius: 3px;
+            transition: width 0.5s ease;
+        }
+
+        .actions {
+            margin-top: 1.5rem;
+            display: flex;
+            gap: 1rem;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+        }
+
+        button.export {
+            background: var(--border);
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 0.5rem;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: all 0.2s ease;
+        }
+
+        button.export:hover {
+            background: #475569;
+            transform: translateY(-1px);
+        }
+
+        button.export:active {
+            transform: translateY(0);
+        }
+
+        /* Error */
+        .error {
+            color: var(--danger);
+            margin-top: 1rem;
+            padding: 1rem;
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            border-radius: 0.5rem;
+            display: none;
+        }
+
+        /* Footer */
+        footer {
+            margin-top: auto;
+            padding-top: 3rem;
+            color: var(--muted);
+            font-size: 0.75rem;
+            text-align: center;
+        }
+
+        /* Responsive */
+        @media (max-width: 640px) {
+            h1 { font-size: 1.75rem; }
+            .upload-card { padding: 2rem 1rem; }
+            th, td { padding: 0.65rem 0.5rem; font-size: 0.85rem; }
+            .actions { justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>BookShelf Sniper</h1>
+        <p class="subtitle">Transformez vos photos de livres en cash.</p>
+    </header>
+
+    <div class="container">
+        <div class="upload-card" id="drop-zone" role="button" tabindex="0" aria-label="Zone de dépôt pour télécharger une image de livres">
+            <span class="upload-icon" aria-hidden="true">📸</span>
+            <p>Glissez une photo de vos tranches de livres ici</p>
+            <p style="font-size: 0.8rem; color: var(--muted); margin-top: 0.5rem;">ou cliquez pour choisir un fichier (JPG, PNG — max 10 MB)</p>
+            <input type="file" id="file-input" accept="image/jpeg,image/png,image/webp" aria-label="Sélectionner une image">
+        </div>
+
+        <div class="preview-container" id="preview-container">
+            <img id="preview-img" alt="Aperçu de l'image sélectionnée">
+        </div>
+
+        <div class="loader" id="loader" role="status" aria-live="polite">
+            <div class="spinner" aria-hidden="true"></div>
+            <p id="status-text">Analyse en cours…</p>
+            <div class="progress-steps">
+                <span class="progress-step" id="step-detect" data-step="1">📷 Détection</span>
+                <span class="progress-step" id="step-ocr" data-step="2">🔤 OCR</span>
+                <span class="progress-step" id="step-isbn" data-step="3">📚 ISBN</span>
+                <span class="progress-step" id="step-price" data-step="4">💰 Prix</span>
+            </div>
+        </div>
+
+        <div class="error" id="error-box" role="alert"></div>
+
+        <div id="results">
+            <div class="results-header">
+                <span class="results-count" id="results-count"></span>
+            </div>
+            <div class="table-wrapper">
+                <table role="table" aria-label="Résultats de l'analyse des livres">
+                    <thead>
+                        <tr>
+                            <th scope="col">Titre</th>
+                            <th scope="col">ISBN</th>
+                            <th scope="col">Momox</th>
+                            <th scope="col">RecycLivre</th>
+                            <th scope="col">Meilleur Prix</th>
+                            <th scope="col">Confiance</th>
+                        </tr>
+                    </thead>
+                    <tbody id="results-body"></tbody>
+                </table>
+            </div>
+            <div class="actions">
+                <button class="export" id="btn-csv" aria-label="Exporter les résultats au format CSV">Exporter CSV</button>
+                <button class="export" id="btn-json" aria-label="Exporter les résultats au format JSON">Exporter JSON</button>
+            </div>
+        </div>
+    </div>
+
+    <footer>BookShelf Sniper — Open Source</footer>
+
+    <script>
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const loader = document.getElementById('loader');
+        const results = document.getElementById('results');
+        const resultsBody = document.getElementById('results-body');
+        const errorBox = document.getElementById('error-box');
+        const previewContainer = document.getElementById('preview-container');
+        const previewImg = document.getElementById('preview-img');
+        const resultsCount = document.getElementById('results-count');
+
+        const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+        let currentData = [];
+
+        // Accessible click and keyboard support
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                fileInput.click();
+            }
+        });
+
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+        });
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length) handleFile(fileInput.files[0]);
+        });
+
+        // Export buttons
+        document.getElementById('btn-csv').addEventListener('click', () => exportData('csv'));
+        document.getElementById('btn-json').addEventListener('click', () => exportData('json'));
+
+        function showPreview(file) {
+            const url = URL.createObjectURL(file);
+            previewImg.src = url;
+            previewContainer.style.display = 'block';
+        }
+
+        function setStep(stepNumber) {
+            const steps = document.querySelectorAll('.progress-step');
+            steps.forEach(s => {
+                const n = parseInt(s.dataset.step);
+                s.classList.remove('active', 'done');
+                if (n < stepNumber) s.classList.add('done');
+                else if (n === stepNumber) s.classList.add('active');
+            });
+        }
+
+        async function handleFile(file) {
+            // Client-side validation
+            if (!file.type.startsWith('image/')) {
+                errorBox.textContent = "Veuillez sélectionner une image (JPG, PNG, WebP).";
+                errorBox.style.display = 'block';
+                return;
+            }
+            if (file.size > MAX_FILE_SIZE) {
+                errorBox.textContent = "L'image est trop volumineuse (max 10 MB).";
+                errorBox.style.display = 'block';
+                return;
+            }
+
+            showPreview(file);
+            loader.style.display = 'block';
+            results.style.display = 'none';
+            errorBox.style.display = 'none';
+            setStep(1);
+
+            const formData = new FormData();
+            formData.append('image', file);
+
+            // Simulate progress steps (the backend does all steps in one call)
+            const progressTimer = setInterval(() => {
+                const active = document.querySelector('.progress-step.active');
+                if (active) {
+                    const current = parseInt(active.dataset.step);
+                    if (current < 4) setStep(current + 1);
+                }
+            }, 4000);
+
+            try {
+                const response = await fetch('/analyze-shelf', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                clearInterval(progressTimer);
+
+                if (!response.ok) {
+                    const err = await response.json().catch(() => null);
+                    throw new Error(err?.detail || "Erreur lors de l'analyse");
+                }
+
+                const data = await response.json();
+                currentData = data;
+                displayResults(data);
+            } catch (err) {
+                errorBox.textContent = err.message;
+                errorBox.style.display = 'block';
+            } finally {
+                clearInterval(progressTimer);
+                loader.style.display = 'none';
+            }
+        }
+
+        function displayResults(data) {
+            resultsBody.innerHTML = '';
+            resultsCount.innerHTML = "<strong>" + data.length + "</strong> livre(s) trouvé(s)";
+
+            if (data.length === 0) {
+                resultsBody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Aucun livre détecté avec prix de rachat.</td></tr>';
+                results.style.display = 'block';
+                return;
+            }
+
+            // Build rows with DocumentFragment for performance
+            const fragment = document.createDocumentFragment();
+            data.forEach(item => {
+                const best = Math.max(item.price_momox, item.price_recyclivre);
+                const confidence = item.confidence_score || 0;
+                const confidencePct = Math.round(confidence * 100);
+
+                const tr = document.createElement('tr');
+                tr.innerHTML =
+                    '<td><strong>' + escapeHtml(item.title) + '</strong><br><small style="color:var(--muted)">' + escapeHtml(item.author || '') + '</small></td>' +
+                    '<td style="font-family:monospace;font-size:0.85rem">' + escapeHtml(item.isbn) + '</td>' +
+                    '<td class="' + (item.price_momox > 0 ? 'price-tag' : 'price-zero') + '">' + item.price_momox.toFixed(2) + ' €</td>' +
+                    '<td class="' + (item.price_recyclivre > 0 ? 'price-tag' : 'price-zero') + '">' + item.price_recyclivre.toFixed(2) + ' €</td>' +
+                    '<td><span class="best-price">' + best.toFixed(2) + ' €</span></td>' +
+                    '<td>' + confidencePct + '%<span class="confidence-bar"><span class="confidence-fill" style="width:' + confidencePct + '%"></span></span></td>';
+                fragment.appendChild(tr);
+            });
+
+            resultsBody.appendChild(fragment);
+            results.style.display = 'block';
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function exportData(format) {
+            if (!currentData.length) return;
+            let blob;
+            if (format === 'json') {
+                blob = new Blob([JSON.stringify(currentData, null, 2)], { type: 'application/json' });
+            } else {
+                const headers = 'Titre,ISBN,Auteur,Momox,RecycLivre,Meilleur Prix,Confiance\n';
+                const csv = currentData.map(i => {
+                    const best = Math.max(i.price_momox, i.price_recyclivre);
+                    return '"' + (i.title || '').replace(/"/g, '""') + '",' +
+                           '"' + (i.isbn || '') + '",' +
+                           '"' + (i.author || '').replace(/"/g, '""') + '",' +
+                           i.price_momox + ',' +
+                           i.price_recyclivre + ',' +
+                           best + ',' +
+                           (i.confidence_score || 0).toFixed(2);
+                }).join('\n');
+                blob = new Blob([headers + csv], { type: 'text/csv;charset=utf-8' });
+            }
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'bookshelf_sniper_export.' + format;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+    </script>
+</body>
+</html>
