@@ -61,6 +61,7 @@ class ImageProcessor:
                 if cls_id == 73 or self._is_custom_model:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     crop = img[y1:y2, x1:x2]
+                    logger.info(f"📦 Détection Livre #{len(spines)+1}: [{x1}, {y1}, {x2}, {y2}] - Taille crop: {crop.shape}")
 
                     # 2. Preprocessing
                     processed_crop = self._preprocess_crop(crop)
@@ -68,33 +69,54 @@ class ImageProcessor:
                     # 3. OCR
                     text = self._ocr_crop(processed_crop)
                     if text:
+                        logger.info(f"  └─ 📝 OCR Lu: '{text}'")
+                        # Filter out standalone small numbers (1-3 digits) as they pollute search
+                        if text.isdigit() and len(text) <= 3:
+                            logger.info(f"  └─ ⚠️ Nombre court ignoré: {text}")
+                            continue
                         spines.append(text)
-
-        # Normalize before deduplication (case-insensitive, stripped)
-        seen = set()
+                    else:
+                        logger.warning(f"  └─ ❌ OCR n'a rien pu lire dans ce crop.")
+        
+        # Normalize and deduplicate (case-insensitive, stripped)
+        spines = sorted(list(set(spines)), key=len, reverse=True)
         unique_spines = []
         for s in spines:
-            normalized = s.lower().strip()
-            if normalized and normalized not in seen:
-                seen.add(normalized)
+            is_subset = False
+            for existing in unique_spines:
+                # If this text is already contained in a longer string, skip it
+                if s.lower() in existing.lower():
+                    is_subset = True
+                    break
+            if not is_subset:
                 unique_spines.append(s)
 
+        logger.info(f"🎯 Total textes uniques après filtrage: {len(unique_spines)}")
         return unique_spines
 
     def _preprocess_crop(self, crop):
-        """Apply basic deskewing or rotation if the spine is horizontal."""
+        """Prepare crop for OCR: rotate if vertical and enhance contrast."""
         h, w = crop.shape[:2]
-        if w > h:
-            # Likely a horizontal spine, rotate it
+        
+        # If it's a vertical spine (tall), rotate it to be horizontal (wide)
+        # Most French/European books are bottom-to-top, so 90 CW makes them L-to-R.
+        # Even if it's top-to-bottom, EasyOCR often handles upside-down better than vertical.
+        if h > w:
             crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
 
-        # Grayscale helps EasyOCR accuracy
+        # Grayscale
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        return gray
+        
+        # Contrast enhancement (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        
+        return enhanced
 
     def _ocr_crop(self, crop) -> str:
         """Extract text from a single spine crop."""
-        results = self.reader.readtext(crop, detail=0)
+        # We use a lower contrast threshold and other params to be more sensitive
+        results = self.reader.readtext(crop, detail=0, paragraph=True)
         return " ".join(results).strip()
 
 

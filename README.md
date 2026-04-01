@@ -29,6 +29,18 @@
    uvicorn app.main:app --reload
    ```
 
+## 🔑 Configuration (Quota Google Books)
+
+Si vous recevez des erreurs `429 Quota Exceeded`, vous devez utiliser une clé API Google Books :
+1. Créez un projet sur la [Google Cloud Console](https://console.cloud.google.com/).
+2. Activez la **Books API**.
+3. Créez des identifiants (Clé API).
+4. Créez un fichier `.env` à la racine du projet :
+   ```env
+   GOOGLE_BOOKS_API_KEY=votre_cle_ici
+   ```
+5. Relancez l'application en exportant la variable ou en utilisant un outil comme `dotenv`.
+
 ## 🧪 Tests
 
 Pour lancer la suite de tests :

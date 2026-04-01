@@ -8,6 +8,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.env
 
 # Project specific
 .idea/
