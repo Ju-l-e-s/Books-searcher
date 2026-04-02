@@ -393,6 +393,7 @@
                 <table role="table" aria-label="Résultats de l'analyse des livres">
                     <thead>
                         <tr>
+                            <th scope="col"><input type="checkbox" id="select-all" aria-label="Tout sélectionner" checked></th>
                             <th scope="col">Couverture</th>
                             <th scope="col">Édition</th>
                             <th scope="col">ISBN</th>
@@ -407,6 +408,7 @@
                 </table>
             </div>
             <div class="actions">
+                <button class="export" id="btn-excel" aria-label="Exporter les résultats au format Excel">Exporter Excel</button>
                 <button class="export" id="btn-csv" aria-label="Exporter les résultats au format CSV">Exporter CSV</button>
                 <button class="export" id="btn-json" aria-label="Exporter les résultats au format JSON">Exporter JSON</button>
             </div>
@@ -415,6 +417,7 @@
 
     <footer>BookShelf Sniper — Open Source</footer>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <script>
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
@@ -425,9 +428,16 @@
         const previewContainer = document.getElementById('preview-container');
         const previewImg = document.getElementById('preview-img');
         const resultsCount = document.getElementById('results-count');
+        const selectAll = document.getElementById('select-all');
 
         const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
         let currentData = [];
+
+        // Select All logic
+        selectAll.addEventListener('change', () => {
+            const checkboxes = document.querySelectorAll('.js-row-checkbox');
+            checkboxes.forEach(cb => cb.checked = selectAll.checked);
+        });
 
         // Accessible click and keyboard support
         dropZone.addEventListener('click', () => fileInput.click());
@@ -456,8 +466,25 @@
         });
 
         // Export buttons
+        document.getElementById('btn-excel').addEventListener('click', () => exportData('xlsx'));
         document.getElementById('btn-csv').addEventListener('click', () => exportData('csv'));
         document.getElementById('btn-json').addEventListener('click', () => exportData('json'));
+
+        function getSelectedData() {
+            const rows = document.querySelectorAll('#results-body tr');
+            const data = [];
+            rows.forEach((row, index) => {
+                const checkbox = row.querySelector('.js-row-checkbox');
+                if (checkbox && checkbox.checked) {
+                    const select = row.querySelector('.js-select');
+                    const candIndex = select ? parseInt(select.value) : 0;
+                    if (currentData[index] && currentData[index].candidates[candIndex]) {
+                        data.push(currentData[index].candidates[candIndex]);
+                    }
+                }
+            });
+            return data;
+        }
 
         function showPreview(file) {
             const url = URL.createObjectURL(file);
@@ -536,20 +563,36 @@
             resultsCount.innerHTML = "<strong>" + data.length + "</strong> livre(s) trouvé(s)";
 
             if (data.length === 0) {
-                resultsBody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted)">Aucun livre détecté avec prix de rachat.</td></tr>';
+                resultsBody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted)">Aucun livre détecté avec prix de rachat.</td></tr>';
                 results.style.display = 'block';
                 return;
             }
+
+            const fragment = document.createDocumentFragment();
+            const placeholder = 'https://via.placeholder.com/48x72?text=?';
 
             data.forEach((spine, spineIndex) => {
                 const tr = document.createElement('tr');
                 tr.id = `spine-row-${spineIndex}`;
                 
+                // Selection Column
+                const tdCheck = document.createElement('td');
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.className = 'js-row-checkbox';
+                checkbox.checked = true;
+                tdCheck.appendChild(checkbox);
+                tr.appendChild(tdCheck);
+
+                // Initial data from candidates[0]
+                const cand = spine.candidates[0] || { isbn: '?', dimensions: {}, price_momox: 0, price_recyclivre: 0, confidence_score: 0 };
+                
                 // Cover Column
                 const tdCover = document.createElement('td');
                 const img = document.createElement('img');
-                img.className = 'cover-img';
-                img.src = spine.candidates[0].cover_url || 'https://via.placeholder.com/48x72?text=?';
+                img.className = 'cover-img js-cover';
+                img.src = cand.cover_url || placeholder;
+                img.onerror = () => { img.src = placeholder; img.onerror = null; };
                 img.alt = 'Couverture';
                 tdCover.appendChild(img);
                 tr.appendChild(tdCover);
@@ -557,7 +600,7 @@
                 // Edition Column (Select)
                 const tdEdition = document.createElement('td');
                 const select = document.createElement('select');
-                select.className = 'edition-select';
+                select.className = 'edition-select js-select';
                 spine.candidates.forEach((cand, candIndex) => {
                     const option = document.createElement('option');
                     option.value = candIndex;
@@ -570,11 +613,9 @@
                 tdEdition.appendChild(select);
                 tr.appendChild(tdEdition);
 
-                // Initial data from candidates[0]
-                const cand = spine.candidates[0];
-                
                 // ISBN Column
                 const tdIsbn = document.createElement('td');
+                tdIsbn.className = 'js-isbn';
                 tdIsbn.style.fontFamily = 'monospace';
                 tdIsbn.style.fontSize = '0.85rem';
                 tdIsbn.textContent = cand.isbn;
@@ -582,6 +623,7 @@
 
                 // Dimensions Column
                 const tdDim = document.createElement('td');
+                tdDim.className = 'js-dimensions';
                 tdDim.style.fontSize = '0.85rem';
                 tdDim.textContent = formatDimensions(cand.dimensions);
                 tr.appendChild(tdDim);
@@ -590,60 +632,72 @@
                 const best = Math.max(cand.price_momox, cand.price_recyclivre);
                 
                 const tdMomox = document.createElement('td');
-                tdMomox.className = cand.price_momox > 0 ? 'price-tag' : 'price-zero';
+                tdMomox.className = 'js-momox ' + (cand.price_momox > 0 ? 'price-tag' : 'price-zero');
                 tdMomox.textContent = cand.price_momox.toFixed(2) + ' €';
                 tr.appendChild(tdMomox);
 
                 const tdRecyc = document.createElement('td');
-                tdRecyc.className = cand.price_recyclivre > 0 ? 'price-tag' : 'price-zero';
+                tdRecyc.className = 'js-recyclivre ' + (cand.price_recyclivre > 0 ? 'price-tag' : 'price-zero');
                 tdRecyc.textContent = cand.price_recyclivre.toFixed(2) + ' €';
                 tr.appendChild(tdRecyc);
 
                 const tdBest = document.createElement('td');
+                tdBest.className = 'js-best';
                 tdBest.innerHTML = `<span class="best-price">${best.toFixed(2)} €</span>`;
                 tr.appendChild(tdBest);
 
                 // Confidence
                 const confidencePct = Math.round(cand.confidence_score * 100);
                 const tdConf = document.createElement('td');
+                tdConf.className = 'js-confidence';
                 tdConf.innerHTML = `${confidencePct}%<span class="confidence-bar"><span class="confidence-fill" style="width:${confidencePct}%"></span></span>`;
                 tr.appendChild(tdConf);
 
-                resultsBody.appendChild(tr);
+                fragment.appendChild(tr);
             });
 
+            resultsBody.appendChild(fragment);
             results.style.display = 'block';
         }
 
         function updateRow(spineIndex, candIndex) {
             const spine = currentData[spineIndex];
+            if (!spine || !spine.candidates[candIndex]) return;
+            
             const cand = spine.candidates[candIndex];
             const row = document.getElementById(`spine-row-${spineIndex}`);
+            if (!row) return;
+
+            const placeholder = 'https://via.placeholder.com/48x72?text=?';
             
             // Update Cover
-            row.cells[0].querySelector('img').src = cand.cover_url || 'https://via.placeholder.com/48x72?text=?';
+            const img = row.querySelector('.js-cover');
+            img.src = cand.cover_url || placeholder;
+            img.onerror = () => { img.src = placeholder; img.onerror = null; };
             
             // Update ISBN
-            row.cells[2].textContent = cand.isbn;
+            row.querySelector('.js-isbn').textContent = cand.isbn;
             
             // Update Dimensions
-            row.cells[3].textContent = formatDimensions(cand.dimensions);
+            row.querySelector('.js-dimensions').textContent = formatDimensions(cand.dimensions);
             
             // Update Momox
-            row.cells[4].className = cand.price_momox > 0 ? 'price-tag' : 'price-zero';
-            row.cells[4].textContent = cand.price_momox.toFixed(2) + ' €';
+            const tdMomox = row.querySelector('.js-momox');
+            tdMomox.className = 'js-momox ' + (cand.price_momox > 0 ? 'price-tag' : 'price-zero');
+            tdMomox.textContent = cand.price_momox.toFixed(2) + ' €';
             
             // Update RecycLivre
-            row.cells[5].className = cand.price_recyclivre > 0 ? 'price-tag' : 'price-zero';
-            row.cells[5].textContent = cand.price_recyclivre.toFixed(2) + ' €';
+            const tdRecyc = row.querySelector('.js-recyclivre');
+            tdRecyc.className = 'js-recyclivre ' + (cand.price_recyclivre > 0 ? 'price-tag' : 'price-zero');
+            tdRecyc.textContent = cand.price_recyclivre.toFixed(2) + ' €';
             
             // Update Best Price
             const best = Math.max(cand.price_momox, cand.price_recyclivre);
-            row.cells[6].innerHTML = `<span class="best-price">${best.toFixed(2)} €</span>`;
+            row.querySelector('.js-best').innerHTML = `<span class="best-price">${best.toFixed(2)} €</span>`;
             
             // Update Confidence
             const confidencePct = Math.round(cand.confidence_score * 100);
-            row.cells[7].innerHTML = `${confidencePct}%<span class="confidence-bar"><span class="confidence-fill" style="width:${confidencePct}%"></span></span>`;
+            row.querySelector('.js-confidence').innerHTML = `${confidencePct}%<span class="confidence-bar"><span class="confidence-fill" style="width:${confidencePct}%"></span></span>`;
         }
 
         function formatDimensions(dim) {
@@ -651,45 +705,59 @@
             return `${dim.height || '?' }x${dim.width || '?'}x${dim.thickness || '?'} cm`;
         }
 
-        function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
         function exportData(format) {
-            if (!currentData.length) return;
-            
-            // Get selected candidates based on current dropdown values
-            const selectedData = currentData.map((spine, index) => {
-                const select = document.querySelector(`#spine-row-${index} .edition-select`);
-                const candIndex = select ? parseInt(select.value) : 0;
-                return spine.candidates[candIndex];
-            });
+            const selectedData = getSelectedData();
+            if (!selectedData.length) {
+                alert("Veuillez sélectionner au moins un livre à exporter.");
+                return;
+            }
 
-            let blob;
             if (format === 'json') {
-                blob = new Blob([JSON.stringify(selectedData, null, 2)], { type: 'application/json' });
-            } else {
-                const headers = 'Titre,ISBN,Auteur,Editeur,Annee,Momox,RecycLivre,Meilleur Prix,Confiance\n';
+                const blob = new Blob([JSON.stringify(selectedData, null, 2)], { type: 'application/json' });
+                downloadBlob(blob, 'bookshelf_sniper_export.json');
+            } else if (format === 'csv') {
+                const headers = 'Titre,ISBN,Auteur,Editeur,Annee,Dimensions,Momox,RecycLivre,Meilleur Prix,Confiance\n';
                 const csv = selectedData.map(i => {
                     const best = Math.max(i.price_momox, i.price_recyclivre);
+                    const dim = formatDimensions(i.dimensions);
                     return '"' + (i.title || '').replace(/"/g, '""') + '",' +
                            '"' + (i.isbn || '') + '",' +
                            '"' + (i.author || '').replace(/"/g, '""') + '",' +
                            '"' + (i.publisher || '').replace(/"/g, '""') + '",' +
                            '"' + (i.year || '') + '",' +
+                           '"' + dim + '",' +
                            i.price_momox + ',' +
                            i.price_recyclivre + ',' +
                            best + ',' +
                            (i.confidence_score || 0).toFixed(2);
                 }).join('\n');
-                blob = new Blob([headers + csv], { type: 'text/csv;charset=utf-8' });
+                const blob = new Blob([headers + csv], { type: 'text/csv;charset=utf-8' });
+                downloadBlob(blob, 'bookshelf_sniper_export.csv');
+            } else if (format === 'xlsx') {
+                const wsData = selectedData.map(i => ({
+                    'Titre': i.title,
+                    'ISBN': i.isbn,
+                    'Auteur': i.author,
+                    'Éditeur': i.publisher,
+                    'Année': i.year,
+                    'Dimensions': formatDimensions(i.dimensions),
+                    'Prix Momox': i.price_momox,
+                    'Prix RecycLivre': i.price_recyclivre,
+                    'Meilleur Prix': Math.max(i.price_momox, i.price_recyclivre),
+                    'Confiance': (i.confidence_score || 0).toFixed(2)
+                }));
+                const ws = XLSX.utils.json_to_sheet(wsData);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Livres");
+                XLSX.writeFile(wb, 'bookshelf_sniper_export.xlsx');
             }
+        }
+
+        function downloadBlob(blob, filename) {
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = 'bookshelf_sniper_export.' + format;
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
