@@ -271,6 +271,32 @@
             transition: width 0.5s ease;
         }
 
+        .cover-img {
+            width: 48px;
+            height: 72px;
+            object-fit: cover;
+            border-radius: 4px;
+            background: var(--border);
+            border: 1px solid var(--border);
+        }
+
+        select.edition-select {
+            background: #2d3e50;
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            padding: 0.4rem;
+            font-size: 0.85rem;
+            width: 100%;
+            max-width: 300px;
+            cursor: pointer;
+        }
+
+        select.edition-select:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
         .actions {
             margin-top: 1.5rem;
             display: flex;
@@ -367,8 +393,10 @@
                 <table role="table" aria-label="Résultats de l'analyse des livres">
                     <thead>
                         <tr>
-                            <th scope="col">Titre</th>
+                            <th scope="col">Couverture</th>
+                            <th scope="col">Édition</th>
                             <th scope="col">ISBN</th>
+                            <th scope="col">Dimensions</th>
                             <th scope="col">Momox</th>
                             <th scope="col">RecycLivre</th>
                             <th scope="col">Meilleur Prix</th>
@@ -469,14 +497,14 @@
             const formData = new FormData();
             formData.append('image', file);
 
-            // Simulate progress steps (the backend does all steps in one call)
+            // Simulate progress steps
             const progressTimer = setInterval(() => {
                 const active = document.querySelector('.progress-step.active');
                 if (active) {
                     const current = parseInt(active.dataset.step);
                     if (current < 4) setStep(current + 1);
                 }
-            }, 4000);
+            }, 3000);
 
             try {
                 const response = await fetch('/analyze-shelf', {
@@ -492,7 +520,6 @@
                 }
 
                 const data = await response.json();
-                currentData = data;
                 displayResults(data);
             } catch (err) {
                 errorBox.textContent = err.message;
@@ -504,35 +531,124 @@
         }
 
         function displayResults(data) {
+            currentData = data;
             resultsBody.innerHTML = '';
             resultsCount.innerHTML = "<strong>" + data.length + "</strong> livre(s) trouvé(s)";
 
             if (data.length === 0) {
-                resultsBody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted)">Aucun livre détecté avec prix de rachat.</td></tr>';
+                resultsBody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted)">Aucun livre détecté avec prix de rachat.</td></tr>';
                 results.style.display = 'block';
                 return;
             }
 
-            // Build rows with DocumentFragment for performance
-            const fragment = document.createDocumentFragment();
-            data.forEach(item => {
-                const best = Math.max(item.price_momox, item.price_recyclivre);
-                const confidence = item.confidence_score || 0;
-                const confidencePct = Math.round(confidence * 100);
-
+            data.forEach((spine, spineIndex) => {
                 const tr = document.createElement('tr');
-                tr.innerHTML =
-                    '<td><strong>' + escapeHtml(item.title) + '</strong><br><small style="color:var(--muted)">' + escapeHtml(item.author || '') + '</small></td>' +
-                    '<td style="font-family:monospace;font-size:0.85rem">' + escapeHtml(item.isbn) + '</td>' +
-                    '<td class="' + (item.price_momox > 0 ? 'price-tag' : 'price-zero') + '">' + item.price_momox.toFixed(2) + ' €</td>' +
-                    '<td class="' + (item.price_recyclivre > 0 ? 'price-tag' : 'price-zero') + '">' + item.price_recyclivre.toFixed(2) + ' €</td>' +
-                    '<td><span class="best-price">' + best.toFixed(2) + ' €</span></td>' +
-                    '<td>' + confidencePct + '%<span class="confidence-bar"><span class="confidence-fill" style="width:' + confidencePct + '%"></span></span></td>';
-                fragment.appendChild(tr);
+                tr.id = `spine-row-${spineIndex}`;
+                
+                // Cover Column
+                const tdCover = document.createElement('td');
+                const img = document.createElement('img');
+                img.className = 'cover-img';
+                img.src = spine.candidates[0].cover_url || 'https://via.placeholder.com/48x72?text=?';
+                img.alt = 'Couverture';
+                tdCover.appendChild(img);
+                tr.appendChild(tdCover);
+
+                // Edition Column (Select)
+                const tdEdition = document.createElement('td');
+                const select = document.createElement('select');
+                select.className = 'edition-select';
+                spine.candidates.forEach((cand, candIndex) => {
+                    const option = document.createElement('option');
+                    option.value = candIndex;
+                    const yearText = cand.year ? ` (${cand.year})` : '';
+                    const publisherText = cand.publisher ? ` - ${cand.publisher}` : '';
+                    option.textContent = `${cand.title}${yearText}${publisherText}`;
+                    select.appendChild(option);
+                });
+                select.onchange = (e) => updateRow(spineIndex, e.target.value);
+                tdEdition.appendChild(select);
+                tr.appendChild(tdEdition);
+
+                // Initial data from candidates[0]
+                const cand = spine.candidates[0];
+                
+                // ISBN Column
+                const tdIsbn = document.createElement('td');
+                tdIsbn.style.fontFamily = 'monospace';
+                tdIsbn.style.fontSize = '0.85rem';
+                tdIsbn.textContent = cand.isbn;
+                tr.appendChild(tdIsbn);
+
+                // Dimensions Column
+                const tdDim = document.createElement('td');
+                tdDim.style.fontSize = '0.85rem';
+                tdDim.textContent = formatDimensions(cand.dimensions);
+                tr.appendChild(tdDim);
+
+                // Prices
+                const best = Math.max(cand.price_momox, cand.price_recyclivre);
+                
+                const tdMomox = document.createElement('td');
+                tdMomox.className = cand.price_momox > 0 ? 'price-tag' : 'price-zero';
+                tdMomox.textContent = cand.price_momox.toFixed(2) + ' €';
+                tr.appendChild(tdMomox);
+
+                const tdRecyc = document.createElement('td');
+                tdRecyc.className = cand.price_recyclivre > 0 ? 'price-tag' : 'price-zero';
+                tdRecyc.textContent = cand.price_recyclivre.toFixed(2) + ' €';
+                tr.appendChild(tdRecyc);
+
+                const tdBest = document.createElement('td');
+                tdBest.innerHTML = `<span class="best-price">${best.toFixed(2)} €</span>`;
+                tr.appendChild(tdBest);
+
+                // Confidence
+                const confidencePct = Math.round(cand.confidence_score * 100);
+                const tdConf = document.createElement('td');
+                tdConf.innerHTML = `${confidencePct}%<span class="confidence-bar"><span class="confidence-fill" style="width:${confidencePct}%"></span></span>`;
+                tr.appendChild(tdConf);
+
+                resultsBody.appendChild(tr);
             });
 
-            resultsBody.appendChild(fragment);
             results.style.display = 'block';
+        }
+
+        function updateRow(spineIndex, candIndex) {
+            const spine = currentData[spineIndex];
+            const cand = spine.candidates[candIndex];
+            const row = document.getElementById(`spine-row-${spineIndex}`);
+            
+            // Update Cover
+            row.cells[0].querySelector('img').src = cand.cover_url || 'https://via.placeholder.com/48x72?text=?';
+            
+            // Update ISBN
+            row.cells[2].textContent = cand.isbn;
+            
+            // Update Dimensions
+            row.cells[3].textContent = formatDimensions(cand.dimensions);
+            
+            // Update Momox
+            row.cells[4].className = cand.price_momox > 0 ? 'price-tag' : 'price-zero';
+            row.cells[4].textContent = cand.price_momox.toFixed(2) + ' €';
+            
+            // Update RecycLivre
+            row.cells[5].className = cand.price_recyclivre > 0 ? 'price-tag' : 'price-zero';
+            row.cells[5].textContent = cand.price_recyclivre.toFixed(2) + ' €';
+            
+            // Update Best Price
+            const best = Math.max(cand.price_momox, cand.price_recyclivre);
+            row.cells[6].innerHTML = `<span class="best-price">${best.toFixed(2)} €</span>`;
+            
+            // Update Confidence
+            const confidencePct = Math.round(cand.confidence_score * 100);
+            row.cells[7].innerHTML = `${confidencePct}%<span class="confidence-bar"><span class="confidence-fill" style="width:${confidencePct}%"></span></span>`;
+        }
+
+        function formatDimensions(dim) {
+            if (!dim || (!dim.height && !dim.width && !dim.thickness)) return "-";
+            return `${dim.height || '?' }x${dim.width || '?'}x${dim.thickness || '?'} cm`;
         }
 
         function escapeHtml(text) {
@@ -543,16 +659,26 @@
 
         function exportData(format) {
             if (!currentData.length) return;
+            
+            // Get selected candidates based on current dropdown values
+            const selectedData = currentData.map((spine, index) => {
+                const select = document.querySelector(`#spine-row-${index} .edition-select`);
+                const candIndex = select ? parseInt(select.value) : 0;
+                return spine.candidates[candIndex];
+            });
+
             let blob;
             if (format === 'json') {
-                blob = new Blob([JSON.stringify(currentData, null, 2)], { type: 'application/json' });
+                blob = new Blob([JSON.stringify(selectedData, null, 2)], { type: 'application/json' });
             } else {
-                const headers = 'Titre,ISBN,Auteur,Momox,RecycLivre,Meilleur Prix,Confiance\n';
-                const csv = currentData.map(i => {
+                const headers = 'Titre,ISBN,Auteur,Editeur,Annee,Momox,RecycLivre,Meilleur Prix,Confiance\n';
+                const csv = selectedData.map(i => {
                     const best = Math.max(i.price_momox, i.price_recyclivre);
                     return '"' + (i.title || '').replace(/"/g, '""') + '",' +
                            '"' + (i.isbn || '') + '",' +
                            '"' + (i.author || '').replace(/"/g, '""') + '",' +
+                           '"' + (i.publisher || '').replace(/"/g, '""') + '",' +
+                           '"' + (i.year || '') + '",' +
                            i.price_momox + ',' +
                            i.price_recyclivre + ',' +
                            best + ',' +
