@@ -4,6 +4,7 @@ import easyocr
 from ultralytics import YOLO
 import io
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -44,81 +45,96 @@ class ImageProcessor:
             return []
 
         # 1. Segmentation
-        # Cast to Any to satisfy the linter when external types are not found
+        # We lower confidence threshold to 0.15 and use a smaller overlap (iou) 
+        # to force YOLO to find individual spines even if they are stacked.
         from typing import Any
-        results: Any = self.model(img)
+        results: Any = self.model(img, conf=0.15, iou=0.3)
         spines = []
 
         for result in results:
             if not hasattr(result, 'boxes'):
                 continue
             for box in result.boxes:
-                # Fix B2: convert Tensor to int before comparison
                 cls_id = int(box.cls.item()) if hasattr(box.cls, 'item') else int(box.cls)
-
-                # If using standard YOLO, class 73 is 'book'
-                # If using custom model, we take all detections
                 if cls_id == 73 or self._is_custom_model:
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    
+                    # Ensure within bounds
+                    h_img, w_img = img.shape[:2]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w_img, x2), min(h_img, y2)
+                    
                     crop = img[y1:y2, x1:x2]
-                    logger.info(f"📦 Détection Livre #{len(spines)+1}: [{x1}, {y1}, {x2}, {y2}] - Taille crop: {crop.shape}")
+                    if crop.size == 0: continue
 
-                    # 2. Preprocessing
-                    processed_crop = self._preprocess_crop(crop)
-
-                    # 3. OCR
-                    text = self._ocr_crop(processed_crop)
-                    if text:
-                        logger.info(f"  └─ 📝 OCR Lu: '{text}'")
-                        # Filter out standalone small numbers (1-3 digits) as they pollute search
-                        if text.isdigit() and len(text) <= 3:
-                            logger.info(f"  └─ ⚠️ Nombre court ignoré: {text}")
-                            continue
-                        spines.append(text)
-                    else:
-                        logger.warning(f"  └─ ❌ OCR n'a rien pu lire dans ce crop.")
+                    # 2. Advanced OCR for this specific box
+                    texts = self._process_single_spine(crop)
+                    spines.extend(texts)
         
-        # Normalize and deduplicate (case-insensitive, stripped)
-        spines = sorted(list(set(spines)), key=len, reverse=True)
-        unique_spines = []
-        for s in spines:
-            is_subset = False
-            for existing in unique_spines:
-                # If this text is already contained in a longer string, skip it
-                if s.lower() in existing.lower():
-                    is_subset = True
-                    break
-            if not is_subset:
-                unique_spines.append(s)
-
-        logger.info(f"🎯 Total textes uniques après filtrage: {len(unique_spines)}")
+        # 3. Final cleaning
+        unique_spines = self._filter_unique_texts(spines)
+        logger.info(f"🎯 Total textes uniques envoyés au resolver: {len(unique_spines)}")
         return unique_spines
 
-    def _preprocess_crop(self, crop):
-        """Prepare crop for OCR: rotate if vertical and enhance contrast."""
+    def _process_single_spine(self, crop) -> list[str]:
+        """OCR a single detected spine with orientation checks."""
         h, w = crop.shape[:2]
         
-        # If it's a vertical spine (tall), rotate it to be horizontal (wide)
-        # Most French/European books are bottom-to-top, so 90 CW makes them L-to-R.
-        # Even if it's top-to-bottom, EasyOCR often handles upside-down better than vertical.
+        # Orient crop horizontally for OCR
         if h > w:
             crop = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
+            h, w = w, h
 
-        # Grayscale
+        # Try OCR in both directions (normal and 180 reversed)
+        # because book spines can be oriented either way.
+        results_normal = self._ocr_raw(crop)
+        
+        # Flip and try again
+        crop_flipped = cv2.rotate(crop, cv2.ROTATE_180)
+        results_flipped = self._ocr_raw(crop_flipped)
+        
+        # Build text strings
+        text_normal = " ".join(results_normal).strip()
+        text_flipped = " ".join(results_flipped).strip()
+        
+        final_texts = []
+        if len(text_normal) > 5: final_texts.append(text_normal)
+        if len(text_flipped) > 5: final_texts.append(text_flipped)
+        
+        # If the crop is thick, it might be a merged detection. Try a split.
+        if h > (w * 0.15):
+            mid = h // 2
+            for part in [crop[0:mid, :], crop[mid:h, :]]:
+                t = " ".join(self._ocr_raw(part)).strip()
+                if len(t) > 5: final_texts.append(t)
+
+        return final_texts
+
+    def _ocr_raw(self, crop) -> list[str]:
+        """Perform raw OCR on a crop and return list of text segments."""
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # Normalize to improve readability
+        norm = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+        return self.reader.readtext(norm, detail=0, paragraph=True)
+
+    def _filter_unique_texts(self, texts: list[str]) -> list[str]:
+        """Rigorous deduplication: remove overlaps and garbage."""
+        # Clean segments
+        cleaned = []
+        for t in texts:
+            # Remove non-alphanumeric noise at edges
+            t = re.sub(r'^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$', '', t).strip()
+            if len(t) > 4:
+                cleaned.append(t)
         
-        # Contrast enhancement (CLAHE)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        
-        return enhanced
-
-    def _ocr_crop(self, crop) -> str:
-        """Extract text from a single spine crop."""
-        # We use a lower contrast threshold and other params to be more sensitive
-        results = self.reader.readtext(crop, detail=0, paragraph=True)
-        return " ".join(results).strip()
+        # Dedup and remove subsets
+        cleaned = sorted(list(set(cleaned)), key=len, reverse=True)
+        unique = []
+        for t in cleaned:
+            if not any(t.lower() in other.lower() for other in unique):
+                unique.append(t)
+        return unique
 
 
-# Singleton instance (models are lazy-loaded on first request)
+# Singleton instance
 processor = ImageProcessor()

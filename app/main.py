@@ -51,8 +51,10 @@ async def read_index():
 async def _process_ocr_results(ocr_items: List[OCRItem]) -> List[SpineResult]:
     """Shared logic for resolving ISBNs and fetching prices for multiple candidates."""
     if not ocr_items:
+        logger.info("No OCR items to process.")
         return []
 
+    logger.info(f"Processing {len(ocr_items)} OCR items...")
     resolve_tasks = [resolver.resolve(item.text, item.bbox_ratio) for item in ocr_items]
     resolved_results: List[Any] = await asyncio.gather(*resolve_tasks, return_exceptions=True)
 
@@ -62,11 +64,15 @@ async def _process_ocr_results(ocr_items: List[OCRItem]) -> List[SpineResult]:
     for item, candidates in zip(ocr_items, resolved_results):
         if isinstance(candidates, Exception) or not candidates:
             if isinstance(candidates, Exception):
-                logger.warning("ISBN resolution failed for '%s': %s", item.text, candidates)
+                logger.warning(f"ISBN resolution failed for '{item.text}': {candidates}")
+            else:
+                logger.warning(f"No ISBN candidates found for '{item.text}'")
             continue
         
+        logger.info(f"Found {len(candidates)} candidates for '{item.text}'")
         book_candidates = []
         for cand in candidates:
+            logger.info(f"  - Candidate: {cand.get('title')} ({cand.get('isbn')}) - Score: {cand.get('score')}")
             # Note: cand is a dict from resolver.resolve
             book_candidates.append(BookCandidate(
                 title=str(cand.get("title", "Unknown")),
@@ -86,10 +92,12 @@ async def _process_ocr_results(ocr_items: List[OCRItem]) -> List[SpineResult]:
         ))
 
     if not spine_results:
+        logger.info("No spine results after ISBN resolution.")
         return []
 
     # 2. Fetch prices in parallel for ALL candidates (using a set of ISBNs)
     all_isbns = {c.isbn for s in spine_results for c in s.candidates}
+    logger.info(f"Fetching prices for {len(all_isbns)} unique ISBNs...")
     price_tasks = {isbn: pricer.get_prices(isbn) for isbn in all_isbns}
     
     isbns_to_fetch = list(price_tasks.keys())
@@ -99,8 +107,9 @@ async def _process_ocr_results(ocr_items: List[OCRItem]) -> List[SpineResult]:
     for isbn, result in zip(isbns_to_fetch, prices_list):
         if not isinstance(result, Exception):
             price_map[isbn] = result
+            logger.info(f"  - Prices for {isbn}: Momox={result.get('momox')}, RecycLivre={result.get('recyclivre')}")
         else:
-            logger.warning("Pricing failed for ISBN %s: %s", isbn, result)
+            logger.warning(f"Pricing failed for ISBN {isbn}: {result}")
 
     # 3. Assign prices back to candidates
     for spine in spine_results:
@@ -110,7 +119,9 @@ async def _process_ocr_results(ocr_items: List[OCRItem]) -> List[SpineResult]:
             cand.price_recyclivre = float(prices.get("recyclivre", 0.0))
 
     # 4. Sort and return
-    return synthesizer.merge_and_sort_spines(spine_results)
+    results = synthesizer.merge_and_sort_spines(spine_results)
+    logger.info(f"Final results count: {len(results)}")
+    return results
 
 
 @app.post("/analyze-shelf", response_model=List[SpineResult])

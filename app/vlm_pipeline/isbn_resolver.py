@@ -3,6 +3,7 @@ import httpx
 from rapidfuzz import fuzz
 import logging
 from typing import Dict, Any, Optional
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +28,17 @@ async def resolve_isbn_async(book_dict: Dict[str, Any]) -> Optional[str]:
             resp.raise_for_status()
             data = resp.json()
             
+            # Simple check for httpx Response.json() which is a method, not a coroutine in standard httpx
+            # but some mocks or wrappers might make it one.
+            if asyncio.iscoroutine(data):
+                data = await data
+            
             best_isbn = None
             best_score = 0.0
             
-            for item in data.get("items", []):
+            items = data.get("items", []) if isinstance(data, dict) else []
+            
+            for item in items:
                 info = item.get("volumeInfo", {})
                 # Extract ISBNs
                 isbns = [i["identifier"] for i in info.get("industryIdentifiers", []) if i.get("type") in ("ISBN_13", "ISBN_10")]
