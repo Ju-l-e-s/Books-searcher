@@ -137,15 +137,19 @@ class TestLifecycle:
 
     async def test_stop_closes_all_resources(self, scraper):
         """stop() must close the HTTP client, browser, and Playwright instance."""
-        scraper._client = AsyncMock()
-        scraper._browser = AsyncMock()
-        scraper._playwright = AsyncMock()
+        mock_client = AsyncMock()
+        mock_browser = AsyncMock()
+        mock_playwright = AsyncMock()
+        
+        scraper._client = mock_client
+        scraper._browser = mock_browser
+        scraper._playwright = mock_playwright
 
         await scraper.stop()
 
-        scraper._client.aclose.assert_called_once()
-        scraper._browser.close.assert_called_once()
-        scraper._playwright.stop.assert_called_once()
+        mock_client.aclose.assert_called_once()
+        mock_browser.close.assert_called_once()
+        mock_playwright.stop.assert_called_once()
         assert scraper._client is None
         assert scraper._browser is None
         assert scraper._playwright is None

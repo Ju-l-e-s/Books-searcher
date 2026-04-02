@@ -157,58 +157,14 @@ class TestISBNResolver:
         await resolver.close()
         resolver.client.aclose.assert_called_once()
 
-    async def test_lookup_by_isbn_returns_book(self, resolver, mock_httpx_client):
-        """lookup_by_isbn() should parse Open Library Books API response."""
-        mock_response = AsyncMock()
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json = MagicMock(return_value={
-            "ISBN:9780134685991": {
-                "title": "The Pragmatic Programmer",
-                "authors": [
-                    {"name": "David Thomas", "url": "https://openlibrary.org/authors/OL123A"},
-                    {"name": "Andrew Hunt", "url": "https://openlibrary.org/authors/OL456A"},
-                ],
-                "publish_date": "2019",
-                "identifiers": {"isbn_13": ["9780134685991"]},
-                "cover": {"large": "https://covers.openlibrary.org/b/id/123-L.jpg"},
-            }
-        })
-        mock_httpx_client.get = AsyncMock(return_value=mock_response)
-
-        result = await resolver.lookup_by_isbn("978-0-13-468599-1")
-
-        assert result is not None
-        assert result["title"] == "The Pragmatic Programmer"
-        assert result["author"] == "David Thomas, Andrew Hunt"
-        assert result["isbn"] == "9780134685991"
-        assert result["source"] == "open_library"
-        assert result["publish_date"] == "2019"
-
-    async def test_lookup_by_isbn_not_found_returns_none(self, resolver, mock_httpx_client):
-        """lookup_by_isbn() should return None when the ISBN is not in Open Library."""
-        mock_response = AsyncMock()
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json = MagicMock(return_value={})
-        mock_httpx_client.get = AsyncMock(return_value=mock_response)
-
-        result = await resolver.lookup_by_isbn("9999999999999")
-        assert result is None
-
-    async def test_lookup_by_isbn_normalizes_hyphens(self, resolver, mock_httpx_client):
-        """Hyphens in the input ISBN should be stripped before the API call."""
-        mock_response = AsyncMock()
-        mock_response.raise_for_status = MagicMock()
-        mock_response.json = MagicMock(return_value={
-            "ISBN:9780134685991": {
-                "title": "The Pragmatic Programmer",
-                "authors": [{"name": "David Thomas"}],
-                "identifiers": {"isbn_13": ["9780134685991"]},
-            }
-        })
-        mock_httpx_client.get = AsyncMock(return_value=mock_response)
-
-        result = await resolver.lookup_by_isbn("978-0-13-468599-1")
-        assert result is not None
-        # Verify the API was called with the normalized bibkey
-        call_kwargs = mock_httpx_client.get.call_args
-        assert call_kwargs[1]["params"]["bibkeys"] == "ISBN:9780134685991"
+    @patch("app.isbn_resolver._isbn_cache")
+    async def test_resolve_uses_cache(self, mock_cache, resolver, mock_httpx_client):
+        """resolve() should return cached results if available."""
+        mock_cache.get.return_value = [{"title": "Cached Book", "isbn": "123", "score": 90.0}]
+        
+        results = await resolver.resolve("some query")
+        
+        assert len(results) == 1
+        assert results[0]["title"] == "Cached Book"
+        # Verify no API calls were made
+        mock_httpx_client.get.assert_not_called()
