@@ -30,7 +30,7 @@ class TestISBNResolver:
         assert result == []
 
     async def test_google_books_returns_candidates(self, resolver, mock_httpx_client):
-        """Google Books should return formatted candidates with ISBN."""
+        """Google Books should return formatted candidates with ISBN, dimensions, and cover."""
         mock_response = AsyncMock()
         mock_response.raise_for_status = MagicMock()
         mock_response.json = MagicMock(return_value={
@@ -39,9 +39,19 @@ class TestISBNResolver:
                     "volumeInfo": {
                         "title": "Le Petit Prince",
                         "authors": ["Antoine de Saint-Exupéry"],
+                        "publisher": "Gallimard",
+                        "publishedDate": "1943-04-06",
                         "industryIdentifiers": [
                             {"type": "ISBN_13", "identifier": "9783125798100"}
-                        ]
+                        ],
+                        "dimensions": {
+                            "height": "18.0 cm",
+                            "width": "12.0 cm",
+                            "thickness": "1.0 cm"
+                        },
+                        "imageLinks": {
+                            "thumbnail": "http://example.com/cover.jpg"
+                        }
                     }
                 }
             ]
@@ -54,6 +64,45 @@ class TestISBNResolver:
         assert results[0]["title"] == "Le Petit Prince"
         assert results[0]["isbn"] == "9783125798100"
         assert results[0]["source"] == "google_books"
+        assert results[0]["year"] == "1943"
+        assert results[0]["cover_url"] == "http://example.com/cover.jpg"
+        assert results[0]["dimensions"] == {"height": 18.0, "width": 12.0, "thickness": 1.0}
+
+    def test_parse_dim(self, resolver):
+        """Verify _parse_dim handles various dimension string formats."""
+        assert resolver._parse_dim("18.0 cm") == 18.0
+        assert resolver._parse_dim("18,5 cm") == 18.5
+        assert resolver._parse_dim("20 cm") == 20.0
+        assert resolver._parse_dim(None) is None
+        assert resolver._parse_dim("") is None
+        assert resolver._parse_dim("N/A") is None
+
+    async def test_open_library_returns_candidates(self, resolver, mock_httpx_client):
+        """Open Library should return formatted candidates with cover URL."""
+        mock_response = AsyncMock()
+        mock_response.raise_for_status = MagicMock()
+        mock_response.json = MagicMock(return_value={
+            "docs": [
+                {
+                    "title": "Les Misérables",
+                    "author_name": ["Victor Hugo"],
+                    "publisher": ["Folio"],
+                    "first_publish_year": 1862,
+                    "isbn": ["9782253098517"]
+                }
+            ]
+        })
+        mock_httpx_client.get = AsyncMock(return_value=mock_response)
+
+        results = await resolver._search_open_library("misérables")
+
+        assert len(results) == 1
+        assert results[0]["title"] == "Les Misérables"
+        assert results[0]["isbn"] == "9782253098517"
+        assert results[0]["source"] == "open_library"
+        assert results[0]["year"] == "1862"
+        assert results[0]["cover_url"] == "https://covers.openlibrary.org/b/isbn/9782253098517-M.jpg"
+        assert results[0]["dimensions"] is None
 
     async def test_google_books_no_isbn_skipped(self, resolver, mock_httpx_client):
         """Books without ISBN should be filtered out."""
@@ -203,7 +252,7 @@ class TestISBNResolver:
         assert (score_real - score_noise) >= 80.0
 
     async def test_scoring_with_bbox_ratio(self, resolver):
-        """Verify that bbox_ratio < 0.1 adds a 'Poche' format bonus."""
+        """Verify that bbox_ratio < 0.1 adds a 'Poche' format bonus (fallback)."""
         from app.isbn_resolver import _compute_score
         
         ocr = "Le Petit Prince"
@@ -212,6 +261,26 @@ class TestISBNResolver:
         score_normal = _compute_score(ocr, cand, None, 0.5)
         score_poche = _compute_score(ocr, cand, None, 0.05)
         
-        # fs = 100 * 0.10 = 10 pts bonus
+        # fs = 80 * 0.10 = 8 pts bonus (fallback)
         assert score_poche > score_normal
-        assert score_poche - score_normal == 10.0
+        assert score_poche - score_normal == 8.0
+
+    async def test_scoring_with_triangulation(self, resolver):
+        """Verify that matching bbox_ratio with candidate dimensions adds a 100% format bonus."""
+        from app.isbn_resolver import _compute_score
+        
+        ocr = "Le Petit Prince"
+        # Candidate ratio = 12/18 = 0.66
+        cand = {
+            "title": "Le Petit Prince", 
+            "dimensions": {"height": 18.0, "width": 12.0}
+        }
+        
+        # Matches (bbox_ratio = 0.66)
+        score_match = _compute_score(ocr, cand, None, 0.66)
+        # No match (bbox_ratio = 0.3)
+        score_no_match = _compute_score(ocr, cand, None, 0.3)
+        
+        # fs = 100 * 0.10 = 10 pts bonus for match
+        assert score_match > score_no_match
+        assert score_match - score_no_match == 10.0

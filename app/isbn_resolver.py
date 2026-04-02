@@ -46,6 +46,13 @@ _SECONDARY_AUTHOR_RE = re.compile(
 # Year pattern for anti-millesime check
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
+
+def _tokenize(text: str) -> list[str]:
+    """Split text into lowercase tokens of length >= 3."""
+    tokens = re.split(r"[\s,.\-]+", text.lower())
+    return [t for t in tokens if len(t) >= 3]
+
+
 from app.infrastructure.cache import CacheProvider, get_default_cache
 
 # ── cache configuration ───────────────────────────────────────────────────────
@@ -72,14 +79,12 @@ def _score_author(ocr: str, candidate_author: str, primary_author: Optional[str]
     bonus = 0.0
     if primary_author:
         # Check if this candidate's author matches the detected primary author
-        primary_tokens = re.split(r"[\s,.\-]+", primary_author.lower())
-        primary_tokens = [t for t in primary_tokens if len(t) >= 3]
+        primary_tokens = _tokenize(primary_author)
         if any(t in cand_author_lower for t in primary_tokens):
             bonus = 60.0
     else:
         # Direct check
-        tokens = re.split(r"[\s,.\-]+", cand_author_lower)
-        tokens = [t for t in tokens if len(t) >= 3]
+        tokens = _tokenize(cand_author_lower)
         if any(t in ocr_lower for t in tokens):
             bonus = 60.0
 
@@ -101,10 +106,29 @@ def _score_publisher(ocr: str, candidate_publisher: str) -> float:
     return 0.0
 
 
-def _score_format(bbox_ratio: Optional[float]) -> float:
-    """10 % weight: w/h < 0.1 → 'Poche' format, returns 0 or 100."""
-    if bbox_ratio is not None and bbox_ratio < 0.1:
-        return 100.0
+def _score_format(bbox_ratio: Optional[float], dimensions: Optional[dict] = None) -> float:
+    """10 % weight: w/h ratio matching or 'Poche' hint.
+    
+    If dimensions are available, we triangulate by comparing the ratio.
+    Otherwise, we fallback to a generic 'Poche' hint for narrow spines.
+    """
+    if bbox_ratio is None:
+        return 0.0
+
+    # 1. Triangulation if dimensions are available (height & width)
+    if dimensions and dimensions.get("height") and dimensions.get("width"):
+        # Real physical ratio (width / height)
+        # Note: bbox_ratio from YOLO is also width/height (approx)
+        cand_ratio = float(dimensions["width"]) / float(dimensions["height"])
+        
+        # 20% tolerance for perspective distortion
+        if 0.8 * cand_ratio <= bbox_ratio <= 1.2 * cand_ratio:
+            return 100.0
+
+    # 2. Fallback: narrow spine (< 0.1) likely means "Poche" format
+    if bbox_ratio < 0.1:
+        return 80.0  # Slightly less than an exact dimension match
+
     return 0.0
 
 
@@ -130,11 +154,12 @@ def _compute_score(
     title = candidate.get("title", "")
     author = candidate.get("author", "")
     publisher = candidate.get("publisher", "")
+    dimensions = candidate.get("dimensions")
 
     ts = _score_title(ocr, title) * 0.30
     as_ = _score_author(ocr, author, primary_author) * 0.20
     ps = _score_publisher(ocr, publisher) * 0.40
-    fs = _score_format(bbox_ratio) * 0.10
+    fs = _score_format(bbox_ratio, dimensions) * 0.10
 
     raw = ts + as_ + ps + fs
     return _apply_penalties(raw, title, ocr)
@@ -146,28 +171,23 @@ def _detect_primary_author(ocr: str, candidates: list[dict]) -> Optional[str]:
     Used to suppress secondary authors (illustrateurs, préfaciers).
     """
     ocr_lower = ocr.lower()
+    fallback_author = None
+    
     for cand in candidates:
         author = cand.get("author", "")
         if not author:
             continue
-        # Avoid picking "Collectif" or similar as primary author if possible
-        if _SECONDARY_AUTHOR_RE.search(author.lower()):
-            continue
             
-        tokens = re.split(r"[\s,.\-]+", author.lower())
-        tokens = [t for t in tokens if len(t) >= 3]
+        tokens = _tokenize(author)
         if tokens and any(t in ocr_lower for t in tokens):
-            return author
-            
-    # Fallback to any matching author if no "clean" author found
-    for cand in candidates:
-        author = cand.get("author", "")
-        tokens = re.split(r"[\s,.\-]+", author.lower())
-        tokens = [t for t in tokens if len(t) >= 3]
-        if tokens and any(t in ocr_lower for t in tokens):
-            return author
-            
-    return None
+            if not _SECONDARY_AUTHOR_RE.search(author.lower()):
+                # Found a "clean" primary author
+                return author
+            if fallback_author is None:
+                # Keep first matching secondary author as fallback
+                fallback_author = author
+                
+    return fallback_author
 
 
 # ── external API helpers ──────────────────────────────────────────────────────
@@ -234,6 +254,7 @@ class ISBNResolver:
         return top
 
     async def _search_google_books(self, query: str) -> list[dict]:
+        """Search Google Books for the given query."""
         try:
             resp = await self.client.get(
                 self.GOOGLE_BOOKS_URL, params={"q": query, "maxResults": 5}
@@ -250,19 +271,42 @@ class ISBNResolver:
                 ]
                 if not isbns:
                     continue
+                
+                # Extract dimensions
+                dims_info = info.get("dimensions", {})
+                dims = {
+                    "height": self._parse_dim(dims_info.get("height")),
+                    "width": self._parse_dim(dims_info.get("width")),
+                    "thickness": self._parse_dim(dims_info.get("thickness")),
+                } if dims_info else None
+
                 candidates.append({
                     "title": info.get("title", ""),
                     "author": ", ".join(info.get("authors", [])),
                     "publisher": info.get("publisher", ""),
+                    "year": info.get("publishedDate", "")[:4],
                     "isbn": isbns[0],
                     "source": "google_books",
+                    "cover_url": info.get("imageLinks", {}).get("thumbnail"),
+                    "dimensions": dims,
                 })
             return candidates
         except Exception as exc:
             logger.debug("Google Books search failed: %s", exc)
             return []
 
+    @staticmethod
+    def _parse_dim(dim_str: Optional[str]) -> Optional[float]:
+        """Extract numeric dimension from string (e.g. '18.0 cm')."""
+        if not dim_str: return None
+        # Extract numbers from strings like "18.0 cm"
+        match = re.search(r"(\d+[.,]?\d*)", dim_str)
+        if match:
+            return float(match.group(1).replace(",", "."))
+        return None
+
     async def _search_open_library(self, query: str) -> list[dict]:
+        """Search Open Library for the given query."""
         try:
             resp = await self.client.get(
                 self.OPEN_LIBRARY_URL, params={"q": query, "limit": 5}
@@ -274,12 +318,17 @@ class ISBNResolver:
                 isbn_list = doc.get("isbn", [])
                 if not isbn_list:
                     continue
+                
+                isbn = isbn_list[0]
                 candidates.append({
                     "title": doc.get("title", ""),
                     "author": ", ".join(doc.get("author_name", [])),
                     "publisher": ", ".join(doc.get("publisher", [])),
-                    "isbn": isbn_list[0],
+                    "year": str(doc.get("first_publish_year", "")),
+                    "isbn": isbn,
                     "source": "open_library",
+                    "cover_url": f"https://covers.openlibrary.org/b/isbn/{isbn}-M.jpg",
+                    "dimensions": None,
                 })
             return candidates
         except Exception as exc:

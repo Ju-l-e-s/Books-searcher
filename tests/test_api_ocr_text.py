@@ -2,7 +2,6 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import AsyncMock, patch
 from app.main import app
-from app.models import BookResult
 
 client = TestClient(app)
 
@@ -35,11 +34,14 @@ async def test_analyze_shelf_texts_success():
         assert response.status_code == 200
         results = response.json()
         assert len(results) == 1
-        assert results[0]["title"] == "The Great Gatsby"
-        assert results[0]["isbn"] == "9780743273565"
-        assert results[0]["price_momox"] == 5.5
-        assert results[0]["price_recyclivre"] == 4.2
-        assert results[0]["confidence_score"] == 0.95
+        assert results[0]["original_text"] == "Great Gatsby"
+        assert len(results[0]["candidates"]) == 1
+        cand = results[0]["candidates"][0]
+        assert cand["title"] == "The Great Gatsby"
+        assert cand["isbn"] == "9780743273565"
+        assert cand["price_momox"] == 5.5
+        assert cand["price_recyclivre"] == 4.2
+        assert cand["confidence_score"] == 0.95
 
 @pytest.mark.asyncio
 async def test_analyze_shelf_texts_empty():
