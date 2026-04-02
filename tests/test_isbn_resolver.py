@@ -157,10 +157,12 @@ class TestISBNResolver:
         await resolver.close()
         resolver.client.aclose.assert_called_once()
 
-    @patch("app.isbn_resolver._isbn_cache")
-    async def test_resolve_uses_cache(self, mock_cache, resolver, mock_httpx_client):
+    async def test_resolve_uses_cache(self, mock_httpx_client):
         """resolve() should return cached results if available."""
+        mock_cache = MagicMock()
         mock_cache.get.return_value = [{"title": "Cached Book", "isbn": "123", "score": 90.0}]
+        resolver = ISBNResolver(cache=mock_cache)
+        resolver.client = mock_httpx_client
         
         results = await resolver.resolve("some query")
         
@@ -168,3 +170,48 @@ class TestISBNResolver:
         assert results[0]["title"] == "Cached Book"
         # Verify no API calls were made
         mock_httpx_client.get.assert_not_called()
+        mock_cache.get.assert_called_once()
+
+    async def test_scoring_prioritizes_publisher(self, resolver, mock_httpx_client):
+        """Verify that candidates with matching publishers are scored higher."""
+        from app.isbn_resolver import _compute_score
+        
+        ocr = "Le Petit Prince Gallimard"
+        cand_generic = {"title": "Le Petit Prince", "author": "Saint-Exupéry", "publisher": "Other"}
+        cand_publisher = {"title": "Le Petit Prince", "author": "Saint-Exupéry", "publisher": "Gallimard"}
+        
+        score_generic = _compute_score(ocr, cand_generic, None, None)
+        score_publisher = _compute_score(ocr, cand_publisher, None, None)
+        
+        assert score_publisher > score_generic
+        # ps = 100 * 0.40 = 40 pts difference
+        assert score_publisher - score_generic == 40.0
+
+    async def test_penalty_anti_noise(self, resolver):
+        """Verify that 'Fiche de lecture' titles receive a heavy penalty."""
+        from app.isbn_resolver import _compute_score
+        
+        ocr = "L'Étranger Camus"
+        cand_real = {"title": "L'Étranger", "author": "Albert Camus", "publisher": "Gallimard"}
+        cand_noise = {"title": "Fiche de lecture: L'Étranger", "author": "Collectif", "publisher": "Gallimard"}
+        
+        score_real = _compute_score(ocr, cand_real, "Albert Camus", None)
+        score_noise = _compute_score(ocr, cand_noise, "Albert Camus", None)
+        
+        # -80 pts penalty
+        assert score_noise < score_real
+        assert (score_real - score_noise) >= 80.0
+
+    async def test_scoring_with_bbox_ratio(self, resolver):
+        """Verify that bbox_ratio < 0.1 adds a 'Poche' format bonus."""
+        from app.isbn_resolver import _compute_score
+        
+        ocr = "Le Petit Prince"
+        cand = {"title": "Le Petit Prince", "author": "Saint-Exupéry", "publisher": "Gallimard"}
+        
+        score_normal = _compute_score(ocr, cand, None, 0.5)
+        score_poche = _compute_score(ocr, cand, None, 0.05)
+        
+        # fs = 100 * 0.10 = 10 pts bonus
+        assert score_poche > score_normal
+        assert score_poche - score_normal == 10.0

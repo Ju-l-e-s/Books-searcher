@@ -21,3 +21,12 @@ class BookResult(BaseModel):
 
 class AnalysisResponse(BaseModel):
     results: List[BookResult]
+
+
+class OCRItem(BaseModel):
+    text: str
+    bbox_ratio: Optional[float] = None
+
+
+class AnalysisRequest(BaseModel):
+    items: List[OCRItem]

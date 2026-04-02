@@ -38,58 +38,19 @@ _NOISE_TOKENS = re.compile(
     r"\b(fiche\s+de\s+lecture|analyse|étude|bd|illustré)\b", re.IGNORECASE
 )
 
+# Secondary author tokens to suppress/penalize
+_SECONDARY_AUTHOR_RE = re.compile(
+    r"\b(illustrateur|illustration|préface|introduction|postface|collectif)\b", re.IGNORECASE
+)
+
 # Year pattern for anti-millesime check
 _YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 
-# ── DynamoDB cache (domain-level, optional) ───────────────────────────────────
+from app.infrastructure.cache import CacheProvider, get_default_cache
+
+# ── cache configuration ───────────────────────────────────────────────────────
 _ISBN_TABLE_NAME: Optional[str] = os.environ.get("ISBN_CACHE_TABLE")
 _ISBN_TTL = 30 * 24 * 3600  # 30 days
-
-
-class _DynamoCache:
-    """Thin, fault-tolerant DynamoDB wrapper (synchronous boto3)."""
-
-    def __init__(self, table_name: Optional[str]) -> None:
-        self._table_name = table_name
-        self._table: Any = None
-
-    def _get_table(self) -> Any:
-        if self._table is None and self._table_name:
-            try:
-                import boto3  # imported lazily — not available in tests
-                self._table = boto3.resource("dynamodb").Table(self._table_name)
-            except Exception as exc:
-                logger.debug("DynamoDB unavailable: %s", exc)
-        return self._table
-
-    def get(self, key: str) -> Optional[Any]:
-        table = self._get_table()
-        if not table:
-            return None
-        try:
-            resp = table.get_item(Key={"pk": key})
-            item = resp.get("Item")
-            if item and int(item.get("ttl", 0)) > int(time.time()):
-                return json.loads(item["value"])
-        except Exception as exc:
-            logger.debug("DynamoDB get error: %s", exc)
-        return None
-
-    def set(self, key: str, value: Any, ttl_seconds: int) -> None:
-        table = self._get_table()
-        if not table:
-            return
-        try:
-            table.put_item(Item={
-                "pk": key,
-                "value": json.dumps(value, ensure_ascii=False),
-                "ttl": int(time.time()) + ttl_seconds,
-            })
-        except Exception as exc:
-            logger.debug("DynamoDB put error: %s", exc)
-
-
-_isbn_cache = _DynamoCache(_ISBN_TABLE_NAME)
 
 
 # ── scoring helpers ───────────────────────────────────────────────────────────
@@ -105,23 +66,38 @@ def _score_author(ocr: str, candidate_author: str, primary_author: Optional[str]
     If a primary author is known, secondary authors (illustrateurs, préfaciers)
     are ignored — only the primary author is checked.
     """
-    author_to_check = primary_author if primary_author else candidate_author
-    if not author_to_check:
-        return 0.0
-    # Split on common separators; check each token
-    tokens = re.split(r"[\s,.\-]+", author_to_check.lower())
-    tokens = [t for t in tokens if len(t) >= 3]
     ocr_lower = ocr.lower()
-    if any(t in ocr_lower for t in tokens):
-        return 60.0
-    return 0.0
+    cand_author_lower = candidate_author.lower()
+    
+    bonus = 0.0
+    if primary_author:
+        # Check if this candidate's author matches the detected primary author
+        primary_tokens = re.split(r"[\s,.\-]+", primary_author.lower())
+        primary_tokens = [t for t in primary_tokens if len(t) >= 3]
+        if any(t in cand_author_lower for t in primary_tokens):
+            bonus = 60.0
+    else:
+        # Direct check
+        tokens = re.split(r"[\s,.\-]+", cand_author_lower)
+        tokens = [t for t in tokens if len(t) >= 3]
+        if any(t in ocr_lower for t in tokens):
+            bonus = 60.0
+
+    # Suppress/penalize secondary authors
+    if bonus > 0 and _SECONDARY_AUTHOR_RE.search(cand_author_lower):
+        bonus -= 20.0  # Apply a penalty to secondary-author heavy candidates
+
+    return bonus
 
 
 def _score_publisher(ocr: str, candidate_publisher: str) -> float:
     """40 % weight: binary keyword match, returns 0 or 100."""
-    combined = (ocr + " " + candidate_publisher).lower()
-    if any(kw in combined for kw in PUBLISHER_KEYWORDS):
-        return 100.0
+    ocr_lower = ocr.lower()
+    cand_pub_lower = candidate_publisher.lower()
+    # Both OCR and candidate must share a publisher keyword
+    for kw in PUBLISHER_KEYWORDS:
+        if kw in cand_pub_lower and kw in ocr_lower:
+            return 100.0
     return 0.0
 
 
@@ -169,12 +145,28 @@ def _detect_primary_author(ocr: str, candidates: list[dict]) -> Optional[str]:
 
     Used to suppress secondary authors (illustrateurs, préfaciers).
     """
+    ocr_lower = ocr.lower()
+    for cand in candidates:
+        author = cand.get("author", "")
+        if not author:
+            continue
+        # Avoid picking "Collectif" or similar as primary author if possible
+        if _SECONDARY_AUTHOR_RE.search(author.lower()):
+            continue
+            
+        tokens = re.split(r"[\s,.\-]+", author.lower())
+        tokens = [t for t in tokens if len(t) >= 3]
+        if tokens and any(t in ocr_lower for t in tokens):
+            return author
+            
+    # Fallback to any matching author if no "clean" author found
     for cand in candidates:
         author = cand.get("author", "")
         tokens = re.split(r"[\s,.\-]+", author.lower())
         tokens = [t for t in tokens if len(t) >= 3]
-        if tokens and any(t in ocr.lower() for t in tokens):
+        if tokens and any(t in ocr_lower for t in tokens):
             return author
+            
     return None
 
 
@@ -184,8 +176,9 @@ class ISBNResolver:
     GOOGLE_BOOKS_URL = "https://www.googleapis.com/books/v1/volumes"
     OPEN_LIBRARY_URL = "https://openlibrary.org/search.json"
 
-    def __init__(self) -> None:
+    def __init__(self, cache: Optional[CacheProvider] = None) -> None:
         self.client = httpx.AsyncClient(timeout=10.0)
+        self._cache = cache or get_default_cache(_ISBN_TABLE_NAME)
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -203,8 +196,8 @@ class ISBNResolver:
         query = query.strip()
         cache_key = hashlib.sha256(query.encode()).hexdigest()
 
-        # Cache read (run sync boto3 in thread to avoid blocking event loop)
-        cached = await asyncio.to_thread(_isbn_cache.get, cache_key)
+        # Cache read
+        cached = await asyncio.to_thread(self._cache.get, cache_key)
         if cached is not None:
             logger.debug("ISBN cache hit for query hash %s", cache_key[:8])
             return cached
@@ -236,7 +229,7 @@ class ISBNResolver:
         top = candidates[:3]
 
         # Cache write
-        await asyncio.to_thread(_isbn_cache.set, cache_key, top, _ISBN_TTL)
+        await asyncio.to_thread(self._cache.set, cache_key, top, _ISBN_TTL)
 
         return top
 

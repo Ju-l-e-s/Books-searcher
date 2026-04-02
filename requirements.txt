@@ -1,7 +1,16 @@
+# Core API
 fastapi>=0.100.0
+uvicorn>=0.22.0
 mangum>=0.17.0
 pydantic>=2.0.0
 python-multipart>=0.0.6
 httpx>=0.24.0
+
+# Business Logic
 rapidfuzz>=3.1.0
 boto3>=1.26.0
+
+# Local Image Processing (Optional for Lambda if using Rekognition later)
+ultralytics>=8.0.0
+opencv-python-headless>=4.8.0
+easyocr>=1.7.0
