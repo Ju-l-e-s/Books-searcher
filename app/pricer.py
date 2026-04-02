@@ -20,13 +20,19 @@ logger = logging.getLogger(__name__)
 # ── HTTP headers (mobile UA — lighter bot fingerprint) ────────────────────────
 _MOBILE_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/17.0 Mobile/15E148 Safari/604.1"
+        "Version/17.4 Mobile/15E148 Safari/604.1"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # ── Momox endpoints (fastest-first) ──────────────────────────────────────────
@@ -44,53 +50,11 @@ _RECYCLIVRE_URLS = [
 
 _PRICE_RE = re.compile(r"(\d+[.,]\d{2})\s*€")
 
-# ── DynamoDB cache (infrastructure layer) ─────────────────────────────────────
+from app.infrastructure.cache import CacheProvider, get_default_cache
+
+# ── cache configuration ───────────────────────────────────────────────────────
 _PRICE_TABLE_NAME: Optional[str] = os.environ.get("PRICE_CACHE_TABLE")
 _PRICE_TTL = 24 * 3600  # 24 hours
-
-
-class _DynamoCache:
-    def __init__(self, table_name: Optional[str]) -> None:
-        self._table_name = table_name
-        self._table: Any = None
-
-    def _get_table(self) -> Any:
-        if self._table is None and self._table_name:
-            try:
-                import boto3
-                self._table = boto3.resource("dynamodb").Table(self._table_name)
-            except Exception as exc:
-                logger.debug("DynamoDB unavailable: %s", exc)
-        return self._table
-
-    def get(self, key: str) -> Optional[Any]:
-        table = self._get_table()
-        if not table:
-            return None
-        try:
-            resp = table.get_item(Key={"pk": key})
-            item = resp.get("Item")
-            if item and int(item.get("ttl", 0)) > int(time.time()):
-                return json.loads(item["value"])
-        except Exception as exc:
-            logger.debug("DynamoDB get error: %s", exc)
-        return None
-
-    def set(self, key: str, value: Any, ttl_seconds: int) -> None:
-        table = self._get_table()
-        if not table:
-            return
-        try:
-            table.put_item(Item={
-                "pk": key,
-                "value": json.dumps(value),
-                "ttl": int(time.time()) + ttl_seconds,
-            })
-        except Exception as exc:
-            logger.debug("DynamoDB put error: %s", exc)
-
-
-_price_cache = _DynamoCache(_PRICE_TABLE_NAME)
 
 
 # ── price parsing ─────────────────────────────────────────────────────────────
@@ -128,8 +92,9 @@ def _extract_from_json(data: dict) -> Optional[float]:
 class Pricer:
     """Fetch Momox + RecycLivre buyback prices via direct httpx requests."""
 
-    def __init__(self) -> None:
+    def __init__(self, cache: Optional[CacheProvider] = None) -> None:
         self._client: Optional[httpx.AsyncClient] = None
+        self._cache = cache or get_default_cache(_PRICE_TABLE_NAME)
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -147,39 +112,56 @@ class Pricer:
 
     async def get_prices(self, isbn: str) -> Dict[str, float]:
         """Return {momox, recyclivre} buyback prices. Returns 0.0 when not found."""
-        # Cache read (sync boto3 in thread)
-        cached = await asyncio.to_thread(_price_cache.get, isbn)
+        # Cache read
+        cached = await asyncio.to_thread(self._cache.get, isbn)
         if cached is not None:
             logger.debug("Price cache hit for ISBN %s", isbn)
             return cached
 
-        try:
-            momox_price, recyclivre_price = await asyncio.wait_for(
-                asyncio.gather(
-                    self._fetch_momox(isbn),
-                    self._fetch_recyclivre(isbn),
-                    return_exceptions=True,
-                ),
-                timeout=4.0,
-            )
-        except asyncio.TimeoutError:
+        # Run fetchers in parallel with a hard timeout
+        momox_task = asyncio.create_task(self._fetch_momox(isbn))
+        recyc_task = asyncio.create_task(self._fetch_recyclivre(isbn))
+
+        done, pending = await asyncio.wait(
+            [momox_task, recyc_task],
+            timeout=4.0
+        )
+
+        for task in pending:
+            task.cancel()
             logger.warning("Price fetch timed out for ISBN %s", isbn)
-            momox_price = None
-            recyclivre_price = None
+
+        momox_price = 0.0
+        if momox_task in done:
+            try:
+                momox_price = momox_task.result() or 0.0
+            except Exception as exc:
+                logger.error("Momox fetch failed: %s", exc)
+
+        recyclivre_price = 0.0
+        if recyc_task in done:
+            try:
+                recyclivre_price = recyc_task.result() or 0.0
+            except Exception as exc:
+                logger.error("RecycLivre fetch failed: %s", exc)
 
         result: Dict[str, float] = {
-            "momox": float(momox_price) if isinstance(momox_price, (int, float)) else 0.0,
-            "recyclivre": float(recyclivre_price) if isinstance(recyclivre_price, (int, float)) else 0.0,
+            "momox": float(momox_price),
+            "recyclivre": float(recyclivre_price),
         }
 
-        await asyncio.to_thread(_price_cache.set, isbn, result, _PRICE_TTL)
+        # Cache only if we got at least one non-zero price (optional choice)
+        # or cache always to avoid retrying if both are zero.
+        await asyncio.to_thread(self._cache.set, isbn, result, _PRICE_TTL)
         return result
 
     async def _fetch_momox(self, isbn: str) -> Optional[float]:
         client = self._get_client()
         for url_tpl in _MOMOX_APIS:
             try:
-                resp = await client.get(url_tpl.format(isbn=isbn))
+                # Add referer to look more like a real browser navigation
+                headers = {"Referer": "https://www.momox.fr/fr_FR/volumes/sell/"}
+                resp = await client.get(url_tpl.format(isbn=isbn), headers=headers)
                 if resp.status_code != 200:
                     continue
                 try:
@@ -199,7 +181,8 @@ class Pricer:
         client = self._get_client()
         for url_tpl in _RECYCLIVRE_URLS:
             try:
-                resp = await client.get(url_tpl.format(isbn=isbn))
+                headers = {"Referer": "https://www.recyclivre.com/reprise/"}
+                resp = await client.get(url_tpl.format(isbn=isbn), headers=headers)
                 if resp.status_code != 200:
                     continue
                 try:
